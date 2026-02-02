@@ -8,3 +8,22 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Data
+data/
+
+# Outputs
+outputs/
+
+# Checkpoints
+checkpoints/
+
+# Logs
+logs/
+wandb/
+
+# Environment variables
+.env
+
+# .claude
+.claude/

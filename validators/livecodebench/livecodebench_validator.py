@@ -1,6 +1,9 @@
-import json
 import os
 import re
+import json
+import zlib
+import pickle
+import base64
 import subprocess
 import tempfile
 import torch
@@ -35,7 +38,7 @@ class LiveCodeBenchValidator(Validator):
         ]
 
         self.download_files()
-        self.test_dataset = self.load_dataset()
+        self.test_dataset = self.load_dataset().select(range(8))
 
     def download_files(self):
         for file in self.files:
@@ -133,9 +136,12 @@ class LiveCodeBenchValidator(Validator):
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
         batch_size: int,
-        max_new_tokens: int = 1024,
-        timeout_seconds: int = 10
+        max_new_tokens: int = 4096,
+        max_seq_length: int = 4096,
+        timeout_seconds: int = 10,
     ) -> float:
+        print("Validating LiveCodeBench...")
+
         model.eval()
 
         original_padding_side = tokenizer.padding_side
@@ -146,6 +152,8 @@ class LiveCodeBenchValidator(Validator):
         total_questions = len(self.test_dataset)
 
         for i in range(0, total_questions, batch_size):
+            print(f"Processing batch {i} of {total_questions}")
+
             batch_end = min(i + batch_size, total_questions)
             batch_indices = range(i, batch_end)
             batch_data = self.test_dataset.select(batch_indices)
@@ -164,7 +172,7 @@ class LiveCodeBenchValidator(Validator):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=4096,
+                max_length=max_seq_length,
                 padding_side="left",
             ).to(model.device)
 
@@ -183,7 +191,8 @@ class LiveCodeBenchValidator(Validator):
                 generated_ids, skip_special_tokens=True)
 
             for j, completion in enumerate(completions):
-                raw_test_cases = batch_data[j]["public_test_cases"]
+                raw_test_cases = batch_data[j]["private_test_cases"]
+                raw_test_cases = pickle.loads(zlib.decompress(base64.b64decode(raw_test_cases.encode("utf-8"))))
                 try:
                     test_cases = json.loads(raw_test_cases)
                 except Exception:
@@ -193,4 +202,7 @@ class LiveCodeBenchValidator(Validator):
                 if self.run_test_cases(code, test_cases):
                     correct += 1
 
+        model.train()
+        tokenizer.padding_side = original_padding_side
+        
         return correct / total_questions if total_questions > 0 else 0.0

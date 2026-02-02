@@ -4,12 +4,12 @@ from validators.livecodebench.livecodebench_validator import LiveCodeBenchValida
 
 
 def test_livecodebench_validator():
-    batch_size = 1
-    max_new_tokens = 1024
+    batch_size = 2
+    max_new_tokens = 4096
 
     validator = LiveCodeBenchValidator()
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-1.7B", dtype=torch.bfloat16)
+        "Qwen/Qwen3-1.7B", dtype=torch.bfloat16).to("cuda").eval()
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
 
     result = validator.validate(model, tokenizer, batch_size, max_new_tokens)
