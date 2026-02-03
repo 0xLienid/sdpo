@@ -59,6 +59,13 @@ class SDPOHparams:
     importance_sampling_clip: float = 2.0  # Clip ratio for importance sampling
     clip_advantages: Optional[float] = None  # Optional advantage clipping
 
+    # Distill-on-regen: generate with teacher, then distill student towards teacher's distribution
+    distill_on_regen: bool = False
+    regen_temperature: float = 0.7  # Temperature for teacher regeneration
+
+    # Include student's attempt in teacher context (alongside feedback)
+    include_student_attempt: bool = False
+
     # Rollouts
     num_rollouts: int = 8  # Number of rollouts per question
     rollout_temperature: float = 1.0
@@ -146,9 +153,13 @@ def build_teacher_messages(
     completion: str,
     feedback: str,
     prior_solution: Optional[str],
+    student_attempt: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """Build chat messages for teacher (feedback context + prompt + completion)."""
-    teacher_context_parts = [f"## Feedback\n{feedback}"]
+    teacher_context_parts = []
+    if student_attempt is not None:
+        teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempt}\n```")
+    teacher_context_parts.append(f"## Feedback\n{feedback}")
     if prior_solution is not None:
         teacher_context_parts.append(f"## Prior Correct Solution\n```python\n{prior_solution}\n```")
     teacher_context_parts.append(f"## Original Question\n{prompt}")
@@ -169,6 +180,7 @@ def compute_sdpo_loss(
     feedback: str,
     prior_solution: Optional[str],
     hparams: SDPOHparams,
+    student_attempt: Optional[str] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute the SDPO loss for a single example.
@@ -202,7 +214,7 @@ def compute_sdpo_loss(
     )
 
     # Build teacher messages (feedback context + prompt + completion as assistant)
-    teacher_messages = build_teacher_messages(prompt, completion, feedback, prior_solution)
+    teacher_messages = build_teacher_messages(prompt, completion, feedback, prior_solution, student_attempt)
     teacher_full = tokenizer.apply_chat_template(
         teacher_messages,
         tokenize=False,
@@ -215,7 +227,10 @@ def compute_sdpo_loss(
         tokenize=False,
         add_generation_prompt=True,
     )
-    teacher_context_parts = [f"## Feedback\n{feedback}"]
+    teacher_context_parts = []
+    if student_attempt is not None:
+        teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempt}\n```")
+    teacher_context_parts.append(f"## Feedback\n{feedback}")
     if prior_solution is not None:
         teacher_context_parts.append(f"## Prior Correct Solution\n```python\n{prior_solution}\n```")
     teacher_context_parts.append(f"## Original Question\n{prompt}")
@@ -309,6 +324,271 @@ def compute_sdpo_loss(
     return loss, metrics
 
 
+def build_teacher_regen_prompt(
+    prompt: str,
+    feedback: str,
+    student_attempt: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Build chat messages for teacher regeneration (feedback context + prompt, no completion)."""
+    teacher_context_parts = []
+    if student_attempt is not None:
+        teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempt}\n```")
+    teacher_context_parts.append(f"## Feedback\n{feedback}")
+    teacher_context_parts.append(f"## Original Question\n{prompt}")
+    teacher_context_parts.append("Given the feedback above, provide an improved solution:")
+
+    return [
+        {"role": "user", "content": "\n\n".join(teacher_context_parts)},
+    ]
+
+
+def compute_distill_on_regen_loss(
+    student_model: AutoModelForCausalLM,
+    teacher_model: AutoModelForCausalLM,  # EMA model with shadow weights applied
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    student_completion: str,
+    feedback: str,
+    hparams: SDPOHparams,
+    student_attempt: Optional[str] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute the distill-on-regen loss for a single example.
+
+    Both models stay on their own sequences:
+    1. Student is evaluated on its own completion S - we collect top-K logits at each position
+    2. Teacher regenerates completion T with feedback, evaluated on T
+    3. For each position (up to min(len(S), len(T))), get teacher's logits for student's top-K tokens
+    4. Distill student toward teacher over those top-K tokens
+
+    This keeps student on-policy (reducing forgetting) while teacher's corrections compound
+    (each position conditioned on teacher's prior tokens). The distillation is gentle since
+    we only shift probability mass among tokens the student already considers likely.
+
+    Args:
+        student_model: The student model (current weights)
+        teacher_model: The teacher model (EMA weights, same object with shadow applied)
+        tokenizer: The tokenizer
+        prompt: Original prompt/question
+        student_completion: The student's generated completion
+        feedback: Environment feedback from the student's attempt
+        hparams: Hyperparameters
+        student_attempt: Optional student attempt to include in teacher context
+
+    Returns:
+        loss: The distillation loss tensor
+        metrics: Dictionary of metrics for logging
+    """
+    device = next(student_model.parameters()).device
+    max_seq_length = hparams.max_prompt_length + hparams.max_response_length
+    pad_token_id = tokenizer.pad_token_id
+
+    # === Step 1: Get student's logits on its own completion ===
+    student_messages = build_student_messages(prompt, student_completion)
+    student_full = tokenizer.apply_chat_template(
+        student_messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    student_prompt_only = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    student_encoding = tokenizer(
+        student_full, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=False,
+    ).to(device)
+
+    student_prompt_encoding = tokenizer(
+        student_prompt_only, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=False,
+    )
+
+    student_prompt_len = student_prompt_encoding.input_ids.shape[1]
+    student_total_len = student_encoding.input_ids.shape[1]
+    student_completion_len = student_total_len - student_prompt_len
+
+    if student_completion_len <= 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            "loss": 0.0,
+            "completion_tokens": 0,
+            "teacher_completion_len": 0,
+        }
+
+    # Forward pass for student (with gradients)
+    student_outputs = student_model(**student_encoding)
+    student_logits = student_outputs.logits
+
+    # Extract student's completion logits and create mask for non-pad tokens
+    # Logits at position i predict token i+1
+    student_logits_completion = student_logits[0, student_prompt_len-1:student_prompt_len-1+student_completion_len, :]
+
+    # Get the actual completion token IDs to create pad mask
+    student_completion_ids = student_encoding.input_ids[0, student_prompt_len:student_total_len]
+    student_non_pad_mask = (student_completion_ids != pad_token_id) if pad_token_id is not None else torch.ones_like(student_completion_ids, dtype=torch.bool)
+
+    # === Step 2: Generate teacher's completion with feedback ===
+    # Use left padding for generation
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    teacher_regen_messages = build_teacher_regen_prompt(prompt, feedback, student_attempt)
+    teacher_regen_prompt = tokenizer.apply_chat_template(
+        teacher_regen_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    teacher_regen_inputs = tokenizer(
+        teacher_regen_prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=hparams.max_prompt_length,
+        padding=False,
+    ).to(device)
+
+    teacher_gen_prompt_len = teacher_regen_inputs.input_ids.shape[1]
+
+    with torch.no_grad():
+        generation_kwargs = {
+            "max_new_tokens": student_completion_len,  # Match student's length
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "do_sample": hparams.regen_temperature > 0,
+        }
+        if hparams.regen_temperature > 0:
+            generation_kwargs["temperature"] = hparams.regen_temperature
+            generation_kwargs["top_p"] = 0.95
+
+        teacher_output = teacher_model.generate(
+            **teacher_regen_inputs,
+            **generation_kwargs,
+        )
+
+    tokenizer.padding_side = original_padding_side  # Restore padding side
+
+    # Extract teacher completion, stripping any pad tokens
+    teacher_completion_ids = teacher_output[0, teacher_gen_prompt_len:]
+    if pad_token_id is not None:
+        pad_mask = teacher_completion_ids == pad_token_id
+        if pad_mask.any():
+            first_pad = pad_mask.nonzero(as_tuple=True)[0][0].item()
+            teacher_completion_ids = teacher_completion_ids[:first_pad]
+
+    teacher_completion = tokenizer.decode(teacher_completion_ids, skip_special_tokens=True)
+
+    if len(teacher_completion_ids) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            "loss": 0.0,
+            "completion_tokens": 0,
+            "teacher_completion_len": 0,
+        }
+
+    # === Step 3: Get teacher's logits on its own completion ===
+    teacher_context_parts = []
+    if student_attempt is not None:
+        teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempt}\n```")
+    teacher_context_parts.append(f"## Feedback\n{feedback}")
+    teacher_context_parts.append(f"## Original Question\n{prompt}")
+    teacher_context_parts.append("Given the feedback above, provide an improved solution:")
+    teacher_messages = [
+        {"role": "user", "content": "\n\n".join(teacher_context_parts)},
+        {"role": "assistant", "content": teacher_completion},
+    ]
+    teacher_full = tokenizer.apply_chat_template(
+        teacher_messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    teacher_encoding = tokenizer(
+        teacher_full, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=False,
+    ).to(device)
+
+    teacher_total_len = teacher_encoding.input_ids.shape[1]
+    teacher_completion_len = teacher_total_len - teacher_gen_prompt_len
+
+    with torch.no_grad():
+        teacher_outputs = teacher_model(**teacher_encoding)
+        teacher_logits = teacher_outputs.logits
+
+    # Extract teacher's completion logits
+    teacher_logits_completion = teacher_logits[0, teacher_gen_prompt_len-1:teacher_gen_prompt_len-1+teacher_completion_len, :]
+
+    # Get teacher's completion token IDs for pad mask
+    teacher_completion_token_ids = teacher_encoding.input_ids[0, teacher_gen_prompt_len:teacher_total_len]
+    teacher_non_pad_mask = (teacher_completion_token_ids != pad_token_id) if pad_token_id is not None else torch.ones_like(teacher_completion_token_ids, dtype=torch.bool)
+
+    # === Step 4: Compute loss over min(student_len, teacher_len) positions ===
+    completion_len = min(student_completion_len, teacher_completion_len)
+
+    if completion_len <= 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            "loss": 0.0,
+            "completion_tokens": 0,
+            "teacher_completion_len": len(teacher_completion_ids),
+        }
+
+    # Truncate to common length
+    student_logits_completion = student_logits_completion[:completion_len, :]
+    teacher_logits_completion = teacher_logits_completion[:completion_len, :]
+    student_non_pad_mask = student_non_pad_mask[:completion_len]
+    teacher_non_pad_mask = teacher_non_pad_mask[:completion_len]
+
+    # Combined mask: only compute loss where both have non-pad tokens
+    loss_mask = student_non_pad_mask & teacher_non_pad_mask
+
+    if not loss_mask.any():
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            "loss": 0.0,
+            "completion_tokens": 0,
+            "teacher_completion_len": len(teacher_completion_ids),
+        }
+
+    # Apply temperature
+    student_logits_scaled = student_logits_completion / hparams.temperature
+    teacher_logits_scaled = teacher_logits_completion / hparams.temperature
+
+    # Get top-K indices from student's distribution (student stays on-policy)
+    top_k = hparams.top_k_distillation
+    if top_k > 0 and top_k < student_logits_scaled.shape[-1]:
+        _, top_k_indices = torch.topk(student_logits_scaled, top_k, dim=-1)
+
+        # Gather top-K logits from both models at student's top-K tokens
+        student_topk_logits = torch.gather(student_logits_scaled, -1, top_k_indices)
+        teacher_topk_logits = torch.gather(teacher_logits_scaled, -1, top_k_indices)
+
+        # Softmax over top-K only
+        student_probs = F.softmax(student_topk_logits, dim=-1)
+        student_log_probs = F.log_softmax(student_topk_logits, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_topk_logits, dim=-1)
+    else:
+        student_probs = F.softmax(student_logits_scaled, dim=-1)
+        student_log_probs = F.log_softmax(student_logits_scaled, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_logits_scaled, dim=-1)
+
+    # KL(student || teacher) - shift student toward teacher
+    kl_per_token = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+
+    # Apply loss mask: only average over non-pad positions
+    masked_kl = kl_per_token * loss_mask.float()
+    num_valid_tokens = loss_mask.sum().item()
+    loss = masked_kl.sum() / max(num_valid_tokens, 1)
+
+    metrics = {
+        "loss": loss.item(),
+        "completion_tokens": num_valid_tokens,
+        "kl_per_token": (masked_kl.sum() / max(num_valid_tokens, 1)).item(),
+        "teacher_completion_len": len(teacher_completion_ids),
+    }
+
+    return loss, metrics
+
+
 def sdpo_train(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -376,6 +656,9 @@ def sdpo_train(
                 "top_k_distillation": hparams.top_k_distillation,
                 "num_rollouts": hparams.num_rollouts,
                 "include_prior_solutions": include_prior_solutions,
+                "distill_on_regen": hparams.distill_on_regen,
+                "regen_temperature": hparams.regen_temperature if hparams.distill_on_regen else None,
+                "include_student_attempt": hparams.include_student_attempt,
             },
             init_kwargs={"wandb": {"name": wandb_run_name}} if wandb_run_name else {},
         )
@@ -414,6 +697,10 @@ def sdpo_train(
     logger.info(f"Teacher EMA rate: {hparams.teacher_ema_rate}")
     logger.info(f"Top-K distillation: {hparams.top_k_distillation}")
     logger.info(f"Num rollouts: {hparams.num_rollouts}")
+    if hparams.distill_on_regen:
+        logger.info(f"Distill-on-regen: ENABLED (temp={hparams.regen_temperature})")
+    else:
+        logger.info("Distill-on-regen: disabled (using standard SDPO)")
     logger.info(f"Validators: {[v.name for v, _ in validators]}")
     logger.info(f"Using {accelerator.num_processes} GPUs")
     logger.info(f"Dataloader has {len(dataloader)} batches")
@@ -472,17 +759,33 @@ def sdpo_train(
                         # Apply EMA weights to get teacher
                         ema_teacher.apply_shadow(unwrapped_model)
 
-                        # Compute loss
-                        loss, metrics = compute_sdpo_loss(
-                            student_model=model,
-                            teacher_model=unwrapped_model,  # Has EMA weights applied
-                            tokenizer=tokenizer,
-                            prompt=prompt,
-                            completion=completion,
-                            feedback=feedback,
-                            prior_solution=prior_solution,
-                            hparams=hparams,
-                        )
+                        # Determine student attempt to include in teacher context
+                        student_attempt = completion if hparams.include_student_attempt else None
+
+                        # Compute loss (standard SDPO or distill-on-regen)
+                        if hparams.distill_on_regen:
+                            loss, metrics = compute_distill_on_regen_loss(
+                                student_model=model,
+                                teacher_model=unwrapped_model,  # Has EMA weights applied
+                                tokenizer=tokenizer,
+                                prompt=prompt,
+                                student_completion=completion,
+                                feedback=feedback,
+                                hparams=hparams,
+                                student_attempt=student_attempt,
+                            )
+                        else:
+                            loss, metrics = compute_sdpo_loss(
+                                student_model=model,
+                                teacher_model=unwrapped_model,  # Has EMA weights applied
+                                tokenizer=tokenizer,
+                                prompt=prompt,
+                                completion=completion,
+                                feedback=feedback,
+                                prior_solution=prior_solution,
+                                hparams=hparams,
+                                student_attempt=student_attempt,
+                            )
 
                         # Restore student weights
                         ema_teacher.restore(unwrapped_model)
@@ -524,14 +827,17 @@ def sdpo_train(
 
                 # Log to wandb every step
                 if accelerator.is_main_process:
-                    accelerator.log({
+                    log_dict = {
                         "train/loss": batch_loss,
                         "train/lr": lr,
                         "train/kl_per_token": batch_metrics.get('kl_per_token', 0),
                         "train/completion_tokens": batch_metrics.get('completion_tokens', 0),
                         "train/epoch": epoch,
                         "train/global_step": global_step,
-                    }, step=global_step)
+                    }
+                    if hparams.distill_on_regen:
+                        log_dict["train/teacher_completion_len"] = batch_metrics.get('teacher_completion_len', 0)
+                    accelerator.log(log_dict, step=global_step)
 
                 # Console logging
                 if global_step % hparams.log_interval == 0 or global_step == 1:

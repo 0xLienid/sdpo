@@ -160,6 +160,9 @@ def run_experiment(
             "model_name": config.model_name,
             "include_prior_solutions": config.include_prior_solutions,
             "include_outside_feedback": config.include_outside_feedback,
+            "distill_on_regen": config.distill_on_regen,
+            "regen_temperature": config.regen_temperature if config.distill_on_regen else None,
+            "include_student_attempt": config.include_student_attempt,
             "learning_rate": config.learning_rate,
             "num_epochs": config.num_epochs,
             "batch_size": config.batch_size,
@@ -213,6 +216,11 @@ def run_experiment(
         temperature=config.temperature,
         importance_sampling_clip=config.importance_sampling_clip,
         clip_advantages=config.clip_advantages,
+        # Distill-on-regen
+        distill_on_regen=config.distill_on_regen,
+        regen_temperature=config.regen_temperature,
+        # Student attempt in teacher context
+        include_student_attempt=config.include_student_attempt,
         # Rollouts
         num_rollouts=config.num_rollouts,
         rollout_temperature=config.rollout_temperature,

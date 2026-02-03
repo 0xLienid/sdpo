@@ -63,6 +63,11 @@ class ExperimentConfig:
     # Feedback configuration
     include_prior_solutions: bool = False
     include_outside_feedback: bool = False
+    include_student_attempt: bool = False  # Include student's attempt in teacher context
+
+    # Distill-on-regen: generate with teacher, then distill student towards teacher
+    distill_on_regen: bool = False
+    regen_temperature: float = 0.7
 
     # Outside feedback configuration (if enabled)
     openai_model: str = "gpt-5-mini"
@@ -106,11 +111,57 @@ FULL_FEEDBACK = ExperimentConfig(
     output_dir="outputs/qwen_1_7/full_feedback",
 )
 
+# Experiment 4: Distill-on-regen - teacher generates new completion, then distill
+# This addresses the issue where standard SDPO has the teacher making token-wise
+# corrections on the student's tokens, but each correction only sees prior student
+# tokens (not the teacher's corrections). By having the teacher regenerate, its
+# distribution is internally consistent - each position is conditioned on what the
+# teacher actually generated.
+DISTILL_ON_REGEN = ExperimentConfig(
+    name="distill_on_regen",
+    description="Distill-on-regen: teacher generates with feedback, student distills toward teacher's distribution",
+    include_prior_solutions=False,
+    include_outside_feedback=False,
+    distill_on_regen=True,
+    regen_temperature=0.7,
+    output_dir="outputs/qwen_1_7/distill_on_regen",
+)
+
+# Experiment 5: Environment feedback + student attempt in teacher context
+# The teacher sees the student's attempt alongside the feedback, giving it more
+# context to understand what went wrong and how to correct it.
+ENV_FEEDBACK_WITH_ATTEMPT = ExperimentConfig(
+    name="env_feedback_with_attempt",
+    description="SDPO with environment feedback + student attempt in teacher context",
+    include_prior_solutions=False,
+    include_outside_feedback=False,
+    include_student_attempt=True,
+    distill_on_regen=False,
+    output_dir="outputs/qwen_1_7/env_feedback_with_attempt",
+)
+
+# Experiment 6: Distill-on-regen + student attempt in teacher context
+# Combines distill-on-regen with the student's attempt visible to the teacher
+# when regenerating, so the teacher knows what it's trying to improve.
+DISTILL_ON_REGEN_WITH_ATTEMPT = ExperimentConfig(
+    name="distill_on_regen_with_attempt",
+    description="Distill-on-regen with student attempt + feedback in teacher context",
+    include_prior_solutions=False,
+    include_outside_feedback=False,
+    include_student_attempt=True,
+    distill_on_regen=True,
+    regen_temperature=0.7,
+    output_dir="outputs/qwen_1_7/distill_on_regen_with_attempt",
+)
+
 # All experiments
 ALL_EXPERIMENTS = [
     ENV_FEEDBACK_ONLY,
     ENV_FEEDBACK_WITH_PRIOR,
     FULL_FEEDBACK,
+    DISTILL_ON_REGEN,
+    ENV_FEEDBACK_WITH_ATTEMPT,
+    DISTILL_ON_REGEN_WITH_ATTEMPT,
 ]
 
 

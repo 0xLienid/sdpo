@@ -77,10 +77,20 @@ def livecodebench_rollout(
 
         outputs = model.generate(**inputs, **generation_kwargs)
 
-    # Extract completions
+    # Extract completions, stripping pad tokens
+    pad_token_id = tokenizer.pad_token_id
     results = []
     for i in range(num_rollouts):
         completion_ids = outputs[i, prompt_len:]
+
+        # Strip pad tokens from the end (generated sequences are right-padded)
+        if pad_token_id is not None:
+            # Find first pad token or use full length
+            pad_mask = completion_ids == pad_token_id
+            if pad_mask.any():
+                first_pad = pad_mask.nonzero(as_tuple=True)[0][0].item()
+                completion_ids = completion_ids[:first_pad]
+
         completion = tokenizer.decode(completion_ids, skip_special_tokens=True)
 
         results.append(RolloutResult(
@@ -163,9 +173,18 @@ def batch_rollout(
                 do_sample=False,
             )
 
-        # Extract completions
+        # Extract completions, stripping pad tokens
+        pad_token_id = tokenizer.pad_token_id
         for j, (output, question, prompt_len) in enumerate(zip(outputs, questions, prompt_lengths)):
             completion_ids = output[prompt_len:]
+
+            # Strip pad tokens from the end
+            if pad_token_id is not None:
+                pad_mask = completion_ids == pad_token_id
+                if pad_mask.any():
+                    first_pad = pad_mask.nonzero(as_tuple=True)[0][0].item()
+                    completion_ids = completion_ids[:first_pad]
+
             completion = tokenizer.decode(completion_ids, skip_special_tokens=True)
 
             results.append(RolloutResult(
