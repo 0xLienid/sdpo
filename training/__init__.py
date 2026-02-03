@@ -4,7 +4,7 @@ from training.sdpo import (
     ValidatorRunConfig,
     RolloutResult,
     FeedbackResult,
-    EMAModel,
+    EMATeacher,
 )
 
 __all__ = [
@@ -13,5 +13,5 @@ __all__ = [
     "ValidatorRunConfig",
     "RolloutResult",
     "FeedbackResult",
-    "EMAModel",
+    "EMATeacher",
 ]

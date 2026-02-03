@@ -38,7 +38,7 @@ class ExperimentConfig:
     # Training
     num_epochs: int = 2
     batch_size: int = 1  # Question batch size
-    gradient_accumulation_steps: int = 32
+    gradient_accumulation_steps: int = 2
 
     # Sequence lengths
     max_prompt_length: int = 2048

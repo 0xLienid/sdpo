@@ -101,43 +101,87 @@ class ValidatorRunConfig:
     max_seq_length: int = 2048
 
 
-class EMAModel:
-    """Exponential Moving Average of model parameters."""
+class EMATeacher:
+    """
+    EMA Teacher model that maintains a separate model instance.
 
-    def __init__(self, model: AutoModelForCausalLM, decay: float = 0.99):
+    Unlike the old EMAModel that swapped weights in/out, this maintains
+    a complete separate model that:
+    1. Lives on the same device(s) as the student
+    2. Can be wrapped by DDP for multi-GPU training
+    3. Updates EMA weights in-place without swapping
+    """
+
+    def __init__(
+        self,
+        student_model: AutoModelForCausalLM,
+        decay: float = 0.99,
+        device: Optional[torch.device] = None,
+    ):
         """
+        Create an EMA teacher as a separate model instance.
+
         Args:
-            model: The model to track
+            student_model: The student model to copy architecture and initial weights from
             decay: EMA decay rate (1 - update_rate). Higher = slower updates.
+            device: Device to place teacher on. If None, uses student's device.
         """
         self.decay = decay
-        self.shadow = {}
-        self.backup = {}
 
-        # Initialize shadow parameters
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+        # Create a deep copy of the student model
+        # This creates a completely separate model instance
+        self.model = copy.deepcopy(student_model)
 
-    def update(self, model: AutoModelForCausalLM):
-        """Update EMA parameters."""
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+        # Move to specified device if provided
+        if device is not None:
+            self.model = self.model.to(device)
 
-    def apply_shadow(self, model: AutoModelForCausalLM):
-        """Apply EMA parameters to model (backup current params first)."""
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
+        # Teacher should never require gradients
+        self.model.requires_grad_(False)
+        self.model.eval()
 
-    def restore(self, model: AutoModelForCausalLM):
-        """Restore original parameters from backup."""
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
+    def to(self, device: torch.device) -> "EMATeacher":
+        """Move teacher model to device."""
+        self.model = self.model.to(device)
+        return self
+
+    @torch.no_grad()
+    def update(self, student_model: AutoModelForCausalLM):
+        """
+        Update EMA parameters from student model.
+
+        This should be called after optimizer.step() and only when
+        gradients are synced (accelerator.sync_gradients).
+        """
+        student_params = dict(student_model.named_parameters())
+
+        for name, teacher_param in self.model.named_parameters():
+            if name in student_params:
+                student_param = student_params[name]
+                # EMA update: teacher = decay * teacher + (1 - decay) * student
+                teacher_param.mul_(self.decay).add_(student_param.data, alpha=1 - self.decay)
+
+    @torch.no_grad()
+    def sync_across_processes(self, accelerator: Accelerator):
+        """
+        Synchronize teacher weights across all processes.
+
+        In DDP, each process updates EMA from its local student shard.
+        This syncs teacher weights so all processes have identical teachers.
+        Call this after update() when using multi-GPU training.
+        """
+        if accelerator.num_processes > 1:
+            for param in self.model.parameters():
+                # Average across all processes
+                torch.distributed.all_reduce(param.data, op=torch.distributed.ReduceOp.AVG)
+
+    def __call__(self, *args, **kwargs):
+        """Forward pass through teacher model."""
+        return self.model(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        """Generate with teacher model."""
+        return self.model.generate(*args, **kwargs)
 
 
 def build_student_messages(prompt: str, completion: str) -> List[Dict[str, str]]:
@@ -173,7 +217,7 @@ def build_teacher_messages(
 
 def compute_sdpo_loss(
     student_model: AutoModelForCausalLM,
-    teacher_model: AutoModelForCausalLM,  # EMA model with shadow weights applied
+    teacher_model: AutoModelForCausalLM,  # Separate EMA teacher model
     tokenizer: AutoTokenizer,
     prompt: str,
     completion: str,
@@ -190,7 +234,7 @@ def compute_sdpo_loss(
 
     Args:
         student_model: The student model (current weights)
-        teacher_model: The teacher model (EMA weights, same object with shadow applied)
+        teacher_model: The teacher model (separate EMA model)
         tokenizer: The tokenizer
         prompt: Original prompt/question
         completion: Generated completion to evaluate
@@ -202,7 +246,8 @@ def compute_sdpo_loss(
         loss: The SDPO loss tensor
         metrics: Dictionary of metrics for logging
     """
-    device = next(student_model.parameters()).device
+    student_device = next(student_model.parameters()).device
+    teacher_device = next(teacher_model.parameters()).device
     max_seq_length = hparams.max_prompt_length + hparams.max_response_length
 
     # Build student messages (prompt + completion as assistant)
@@ -245,12 +290,12 @@ def compute_sdpo_loss(
     student_encoding = tokenizer(
         student_full, return_tensors="pt", truncation=True,
         max_length=max_seq_length, padding=False,
-    ).to(device)
+    ).to(student_device)
 
     teacher_encoding = tokenizer(
         teacher_full, return_tensors="pt", truncation=True,
         max_length=max_seq_length, padding=False,
-    ).to(device)
+    ).to(teacher_device)
 
     student_prompt_encoding = tokenizer(
         student_prompt_only, return_tensors="pt", truncation=True,
@@ -279,10 +324,13 @@ def compute_sdpo_loss(
     completion_len = min(student_completion_len, teacher_completion_len)
 
     if completion_len <= 0:
-        return torch.tensor(0.0, device=device, requires_grad=True), {"loss": 0.0, "completion_tokens": 0}
+        return torch.tensor(0.0, device=student_device, requires_grad=True), {"loss": 0.0, "completion_tokens": 0}
 
     student_logits_completion = student_logits[0, student_prompt_len-1:student_prompt_len-1+completion_len, :]
     teacher_logits_completion = teacher_logits[0, teacher_prompt_len-1:teacher_prompt_len-1+completion_len, :]
+
+    # Move teacher logits to student device for loss computation
+    teacher_logits_completion = teacher_logits_completion.to(student_device)
 
     # Apply temperature
     student_logits_scaled = student_logits_completion / hparams.temperature
@@ -344,7 +392,7 @@ def build_teacher_regen_prompt(
 
 def compute_distill_on_regen_loss(
     student_model: AutoModelForCausalLM,
-    teacher_model: AutoModelForCausalLM,  # EMA model with shadow weights applied
+    teacher_model: AutoModelForCausalLM,  # Separate EMA teacher model
     tokenizer: AutoTokenizer,
     prompt: str,
     student_completion: str,
@@ -367,7 +415,7 @@ def compute_distill_on_regen_loss(
 
     Args:
         student_model: The student model (current weights)
-        teacher_model: The teacher model (EMA weights, same object with shadow applied)
+        teacher_model: The teacher model (separate EMA model)
         tokenizer: The tokenizer
         prompt: Original prompt/question
         student_completion: The student's generated completion
@@ -379,7 +427,8 @@ def compute_distill_on_regen_loss(
         loss: The distillation loss tensor
         metrics: Dictionary of metrics for logging
     """
-    device = next(student_model.parameters()).device
+    student_device = next(student_model.parameters()).device
+    teacher_device = next(teacher_model.parameters()).device
     max_seq_length = hparams.max_prompt_length + hparams.max_response_length
     pad_token_id = tokenizer.pad_token_id
 
@@ -400,7 +449,7 @@ def compute_distill_on_regen_loss(
     student_encoding = tokenizer(
         student_full, return_tensors="pt", truncation=True,
         max_length=max_seq_length, padding=False,
-    ).to(device)
+    ).to(student_device)
 
     student_prompt_encoding = tokenizer(
         student_prompt_only, return_tensors="pt", truncation=True,
@@ -412,7 +461,7 @@ def compute_distill_on_regen_loss(
     student_completion_len = student_total_len - student_prompt_len
 
     if student_completion_len <= 0:
-        return torch.tensor(0.0, device=device, requires_grad=True), {
+        return torch.tensor(0.0, device=student_device, requires_grad=True), {
             "loss": 0.0,
             "completion_tokens": 0,
             "teacher_completion_len": 0,
@@ -448,7 +497,7 @@ def compute_distill_on_regen_loss(
         truncation=True,
         max_length=hparams.max_prompt_length,
         padding=False,
-    ).to(device)
+    ).to(teacher_device)
 
     teacher_gen_prompt_len = teacher_regen_inputs.input_ids.shape[1]
 
@@ -481,7 +530,7 @@ def compute_distill_on_regen_loss(
     teacher_completion = tokenizer.decode(teacher_completion_ids, skip_special_tokens=True)
 
     if len(teacher_completion_ids) == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True), {
+        return torch.tensor(0.0, device=student_device, requires_grad=True), {
             "loss": 0.0,
             "completion_tokens": 0,
             "teacher_completion_len": 0,
@@ -507,7 +556,7 @@ def compute_distill_on_regen_loss(
     teacher_encoding = tokenizer(
         teacher_full, return_tensors="pt", truncation=True,
         max_length=max_seq_length, padding=False,
-    ).to(device)
+    ).to(teacher_device)
 
     teacher_total_len = teacher_encoding.input_ids.shape[1]
     teacher_completion_len = teacher_total_len - teacher_gen_prompt_len
@@ -523,11 +572,15 @@ def compute_distill_on_regen_loss(
     teacher_completion_token_ids = teacher_encoding.input_ids[0, teacher_gen_prompt_len:teacher_total_len]
     teacher_non_pad_mask = (teacher_completion_token_ids != pad_token_id) if pad_token_id is not None else torch.ones_like(teacher_completion_token_ids, dtype=torch.bool)
 
+    # Move teacher tensors to student device for loss computation
+    teacher_logits_completion = teacher_logits_completion.to(student_device)
+    teacher_non_pad_mask = teacher_non_pad_mask.to(student_device)
+
     # === Step 4: Compute loss over min(student_len, teacher_len) positions ===
     completion_len = min(student_completion_len, teacher_completion_len)
 
     if completion_len <= 0:
-        return torch.tensor(0.0, device=device, requires_grad=True), {
+        return torch.tensor(0.0, device=student_device, requires_grad=True), {
             "loss": 0.0,
             "completion_tokens": 0,
             "teacher_completion_len": len(teacher_completion_ids),
@@ -543,7 +596,7 @@ def compute_distill_on_regen_loss(
     loss_mask = student_non_pad_mask & teacher_non_pad_mask
 
     if not loss_mask.any():
-        return torch.tensor(0.0, device=device, requires_grad=True), {
+        return torch.tensor(0.0, device=student_device, requires_grad=True), {
             "loss": 0.0,
             "completion_tokens": 0,
             "teacher_completion_len": len(teacher_completion_ids),
@@ -671,19 +724,23 @@ def sdpo_train(
             weight_decay=hparams.weight_decay,
         )
 
-    # Initialize EMA teacher
-    ema_decay = 1.0 - hparams.teacher_ema_rate
-    ema_teacher = EMAModel(model, decay=ema_decay)
-    logger.info(f"Initialized EMA teacher with decay={ema_decay}")
-
     # Initialize prior solutions store
     if prior_solutions_store is None:
         prior_solutions_store = {}
 
-    # Prepare with accelerator
+    # Prepare student model with accelerator FIRST
+    # This moves the model to the correct device(s) and wraps with DDP
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     if scheduler is not None:
         scheduler = accelerator.prepare(scheduler)
+
+    # Initialize EMA teacher AFTER accelerator.prepare()
+    # This ensures the teacher is created from the already-prepared model
+    # and lives on the same device(s) as the student
+    ema_decay = 1.0 - hparams.teacher_ema_rate
+    unwrapped_for_teacher = accelerator.unwrap_model(model)
+    teacher = EMATeacher(unwrapped_for_teacher, decay=ema_decay)
+    # Teacher is already on the right device since we copied from the prepared model
 
     model.train()
 
@@ -693,20 +750,25 @@ def sdpo_train(
     metrics_history = defaultdict(list)
     validation_history = defaultdict(list)
 
-    logger.info(f"Starting SDPO training with {hparams.num_epochs} epochs")
-    logger.info(f"Teacher EMA rate: {hparams.teacher_ema_rate}")
-    logger.info(f"Top-K distillation: {hparams.top_k_distillation}")
-    logger.info(f"Num rollouts: {hparams.num_rollouts}")
-    if hparams.distill_on_regen:
-        logger.info(f"Distill-on-regen: ENABLED (temp={hparams.regen_temperature})")
-    else:
-        logger.info("Distill-on-regen: disabled (using standard SDPO)")
-    logger.info(f"Validators: {[v.name for v, _ in validators]}")
-    logger.info(f"Using {accelerator.num_processes} GPUs")
-    logger.info(f"Dataloader has {len(dataloader)} batches")
+    # Log training config (main process only)
+    if accelerator.is_main_process:
+        logger.info(f"Initialized EMA teacher with decay={ema_decay}")
+        logger.info(f"Teacher device: {next(teacher.model.parameters()).device}")
+        logger.info(f"Starting SDPO training with {hparams.num_epochs} epochs")
+        logger.info(f"Teacher EMA rate: {hparams.teacher_ema_rate}")
+        logger.info(f"Top-K distillation: {hparams.top_k_distillation}")
+        logger.info(f"Num rollouts: {hparams.num_rollouts}")
+        if hparams.distill_on_regen:
+            logger.info(f"Distill-on-regen: ENABLED (temp={hparams.regen_temperature})")
+        else:
+            logger.info("Distill-on-regen: disabled (using standard SDPO)")
+        logger.info(f"Validators: {[v.name for v, _ in validators]}")
+        logger.info(f"Using {accelerator.num_processes} GPUs")
+        logger.info(f"Dataloader has {len(dataloader)} batches")
 
     for epoch in range(hparams.num_epochs):
-        logger.info(f"Starting epoch {epoch + 1}/{hparams.num_epochs}")
+        if accelerator.is_main_process:
+            logger.info(f"Starting epoch {epoch + 1}/{hparams.num_epochs}")
 
         for batch_idx, batch in enumerate(dataloader):
             batch_loss = 0.0
@@ -756,17 +818,15 @@ def sdpo_train(
 
                         prior_solution = prior_solutions_store.get(example_id) if include_prior_solutions else None
 
-                        # Apply EMA weights to get teacher
-                        ema_teacher.apply_shadow(unwrapped_model)
-
                         # Determine student attempt to include in teacher context
                         student_attempt = completion if hparams.include_student_attempt else None
 
                         # Compute loss (standard SDPO or distill-on-regen)
+                        # Teacher is a separate model - no weight swapping needed
                         if hparams.distill_on_regen:
                             loss, metrics = compute_distill_on_regen_loss(
                                 student_model=model,
-                                teacher_model=unwrapped_model,  # Has EMA weights applied
+                                teacher_model=teacher.model,  # Separate EMA teacher model
                                 tokenizer=tokenizer,
                                 prompt=prompt,
                                 student_completion=completion,
@@ -777,7 +837,7 @@ def sdpo_train(
                         else:
                             loss, metrics = compute_sdpo_loss(
                                 student_model=model,
-                                teacher_model=unwrapped_model,  # Has EMA weights applied
+                                teacher_model=teacher.model,  # Separate EMA teacher model
                                 tokenizer=tokenizer,
                                 prompt=prompt,
                                 completion=completion,
@@ -786,9 +846,6 @@ def sdpo_train(
                                 hparams=hparams,
                                 student_attempt=student_attempt,
                             )
-
-                        # Restore student weights
-                        ema_teacher.restore(unwrapped_model)
 
                         # Backward
                         accelerator.backward(loss)
@@ -804,8 +861,6 @@ def sdpo_train(
                     for k in batch_metrics:
                         batch_metrics[k] /= num_rollouts_processed
 
-                total_loss += batch_loss
-
                 # Gradient step
                 if accelerator.sync_gradients:
                     if hparams.max_grad_norm > 0:
@@ -816,19 +871,28 @@ def sdpo_train(
                     scheduler.step()
                 optimizer.zero_grad()
 
-                # Update EMA teacher
+                # Update EMA teacher and sync across processes
                 if accelerator.sync_gradients:
-                    ema_teacher.update(accelerator.unwrap_model(model))
+                    teacher.update(accelerator.unwrap_model(model))
+                    # Sync teacher weights across all GPUs to ensure consistency
+                    teacher.sync_across_processes(accelerator)
 
             # Logging and validation
             if accelerator.sync_gradients:
                 global_step += 1
+
+                # Average loss across all processes for accurate logging
+                loss_tensor = torch.tensor(batch_loss, device=accelerator.device)
+                avg_loss_tensor = accelerator.reduce(loss_tensor, reduction="mean")
+                avg_batch_loss = avg_loss_tensor.item()
+
+                total_loss += avg_batch_loss
                 lr = optimizer.param_groups[0]['lr']
 
-                # Log to wandb every step
+                # Log to wandb every step (main process only)
                 if accelerator.is_main_process:
                     log_dict = {
-                        "train/loss": batch_loss,
+                        "train/loss": avg_batch_loss,
                         "train/lr": lr,
                         "train/kl_per_token": batch_metrics.get('kl_per_token', 0),
                         "train/completion_tokens": batch_metrics.get('completion_tokens', 0),
@@ -839,16 +903,16 @@ def sdpo_train(
                         log_dict["train/teacher_completion_len"] = batch_metrics.get('teacher_completion_len', 0)
                     accelerator.log(log_dict, step=global_step)
 
-                # Console logging
-                if global_step % hparams.log_interval == 0 or global_step == 1:
-                    avg_loss = total_loss / min(global_step, hparams.log_interval)
-                    logger.info(f"Step {global_step} | Loss: {avg_loss:.4f} | LR: {lr:.2e}")
-                    metrics_history['loss'].append(avg_loss)
+                # Console logging (main process only)
+                if accelerator.is_main_process and (global_step % hparams.log_interval == 0 or global_step == 1):
+                    logged_avg_loss = total_loss / min(global_step, hparams.log_interval)
+                    logger.info(f"Step {global_step} | Loss: {logged_avg_loss:.4f} | LR: {lr:.2e}")
+                    metrics_history['loss'].append(logged_avg_loss)
                     metrics_history['step'].append(global_step)
                     total_loss = 0.0
 
-                # Validation
-                if global_step % hparams.validation_interval == 0 or global_step == 1:
+                # Validation (main process only)
+                if accelerator.is_main_process and (global_step % hparams.validation_interval == 0 or global_step == 1):
                     unwrapped_model = accelerator.unwrap_model(model)
                     unwrapped_model.eval()
 
@@ -867,14 +931,15 @@ def sdpo_train(
                                 'step': global_step,
                                 'score': score,
                             })
-
-                            if accelerator.is_main_process:
-                                accelerator.log({f"val/{validator.name}": score}, step=global_step)
+                            accelerator.log({f"val/{validator.name}": score}, step=global_step)
 
                         except Exception as e:
                             logger.error(f"Validator {validator.name} failed: {e}")
 
                     model.train()
+
+                # Non-main processes wait for validation to complete
+                accelerator.wait_for_everyone()
 
                 # Save checkpoint
                 if global_step % hparams.save_interval == 0 and accelerator.is_main_process:
@@ -890,39 +955,40 @@ def sdpo_train(
 
                     logger.info(f"Saved checkpoint to {checkpoint_dir}")
 
-    # Final validation
-    logger.info("Running final validation")
-    unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.eval()
-
+    # Final validation and checkpoint (main process only)
     final_scores = {}
-    for validator, val_config in validators:
-        try:
-            score = validator.validate(
-                model=unwrapped_model,
-                tokenizer=tokenizer,
-                batch_size=val_config.batch_size,
-                max_new_tokens=val_config.max_new_tokens,
-                max_seq_length=val_config.max_seq_length,
-            )
-            final_scores[validator.name] = score
-            logger.info(f"Final {validator.name}: {score:.4f}")
+    if accelerator.is_main_process:
+        logger.info("Running final validation")
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.eval()
 
-            if accelerator.is_main_process:
+        for validator, val_config in validators:
+            try:
+                score = validator.validate(
+                    model=unwrapped_model,
+                    tokenizer=tokenizer,
+                    batch_size=val_config.batch_size,
+                    max_new_tokens=val_config.max_new_tokens,
+                    max_seq_length=val_config.max_seq_length,
+                )
+                final_scores[validator.name] = score
+                logger.info(f"Final {validator.name}: {score:.4f}")
                 accelerator.log({f"val/{validator.name}": score}, step=global_step)
 
-        except Exception as e:
-            logger.error(f"Final validation for {validator.name} failed: {e}")
+            except Exception as e:
+                logger.error(f"Final validation for {validator.name} failed: {e}")
 
-    # Save final checkpoint
-    if accelerator.is_main_process:
+        # Save final checkpoint
         final_dir = os.path.join(output_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
         unwrapped_model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
 
-    if accelerator.is_main_process and wandb_project:
-        accelerator.end_training()
+        if wandb_project:
+            accelerator.end_training()
+
+    # Ensure all processes wait for main to finish
+    accelerator.wait_for_everyone()
 
     return {
         'metrics_history': dict(metrics_history),
