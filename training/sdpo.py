@@ -163,7 +163,8 @@ class EMATeacher:
             if name in student_params:
                 student_param = student_params[name]
                 # EMA update: teacher = decay * teacher + (1 - decay) * student
-                teacher_param.mul_(self.decay).add_(student_param.data, alpha=1 - self.decay)
+                teacher_param.mul_(self.decay).add_(
+                    student_param.data, alpha=1 - self.decay)
 
     @torch.no_grad()
     def sync_across_processes(self, accelerator: Accelerator):
@@ -177,7 +178,8 @@ class EMATeacher:
         if accelerator.num_processes > 1:
             for param in self.model.parameters():
                 # Average across all processes
-                torch.distributed.all_reduce(param.data, op=torch.distributed.ReduceOp.AVG)
+                torch.distributed.all_reduce(
+                    param.data, op=torch.distributed.ReduceOp.AVG)
 
     def __call__(self, *args, **kwargs):
         """Forward pass through teacher model."""
@@ -206,12 +208,15 @@ def build_teacher_messages(
     """Build chat messages for teacher (feedback context + prompt + completion)."""
     teacher_context_parts = []
     if student_attempt is not None:
-        teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempt}\n```")
+        teacher_context_parts.append(
+            f"## Previous Attempt\n```python\n{student_attempt}\n```")
     teacher_context_parts.append(f"## Feedback\n{feedback}")
     if prior_solution is not None:
-        teacher_context_parts.append(f"## Prior Correct Solution\n```python\n{prior_solution}\n```")
+        teacher_context_parts.append(
+            f"## Prior Correct Solution\n```python\n{prior_solution}\n```")
     teacher_context_parts.append(f"## Original Question\n{prompt}")
-    teacher_context_parts.append("Given the feedback above, re-evaluate and improve upon the following attempt:")
+    teacher_context_parts.append(
+        "Given the feedback above, re-evaluate and improve upon the following attempt:")
 
     return [
         {"role": "user", "content": "\n\n".join(teacher_context_parts)},
@@ -293,7 +298,8 @@ def compute_sdpo_loss_batched(
         ).input_ids))
 
         # Teacher sequence
-        teacher_messages = build_teacher_messages(prompt, completion, feedback, prior_solution, student_attempt)
+        teacher_messages = build_teacher_messages(
+            prompt, completion, feedback, prior_solution, student_attempt)
         teacher_full = tokenizer.apply_chat_template(
             teacher_messages, tokenize=False, add_generation_prompt=False,
         )
@@ -301,12 +307,15 @@ def compute_sdpo_loss_batched(
 
         teacher_context_parts = []
         if student_attempt is not None:
-            teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempt}\n```")
+            teacher_context_parts.append(
+                f"## Previous Attempt\n```python\n{student_attempt}\n```")
         teacher_context_parts.append(f"## Feedback\n{feedback}")
         if prior_solution is not None:
-            teacher_context_parts.append(f"## Prior Correct Solution\n```python\n{prior_solution}\n```")
+            teacher_context_parts.append(
+                f"## Prior Correct Solution\n```python\n{prior_solution}\n```")
         teacher_context_parts.append(f"## Original Question\n{prompt}")
-        teacher_context_parts.append("Given the feedback above, re-evaluate and improve upon the following attempt:")
+        teacher_context_parts.append(
+            "Given the feedback above, re-evaluate and improve upon the following attempt:")
         teacher_prompt_only = tokenizer.apply_chat_template(
             [{"role": "user", "content": "\n\n".join(teacher_context_parts)}],
             tokenize=False, add_generation_prompt=True,
@@ -343,8 +352,10 @@ def compute_sdpo_loss_batched(
     completion_lens = []
 
     for i in range(batch_size):
-        student_seq_len = (student_encoding.attention_mask[i] == 1).sum().item()
-        teacher_seq_len = (teacher_encoding.attention_mask[i] == 1).sum().item()
+        student_seq_len = (
+            student_encoding.attention_mask[i] == 1).sum().item()
+        teacher_seq_len = (
+            teacher_encoding.attention_mask[i] == 1).sum().item()
         student_completion_len = student_seq_len - student_prompt_lens[i]
         teacher_completion_len = teacher_seq_len - teacher_prompt_lens[i]
         completion_len = min(student_completion_len, teacher_completion_len)
@@ -359,13 +370,15 @@ def compute_sdpo_loss_batched(
 
         # Extract completion logits for this sequence
         start_pos = student_prompt_lens[i] - 1
-        student_logits_comp = student_logits[i, start_pos:start_pos + completion_len, :]
+        student_logits_comp = student_logits[i,
+                                             start_pos:start_pos + completion_len, :]
 
         # Apply temperature and get top-K
         student_logits_scaled = student_logits_comp / hparams.temperature
         if top_k > 0 and top_k < student_logits_scaled.shape[-1]:
             _, top_k_indices = torch.topk(student_logits_scaled, top_k, dim=-1)
-            student_topk = torch.gather(student_logits_scaled, -1, top_k_indices)
+            student_topk = torch.gather(
+                student_logits_scaled, -1, top_k_indices)
         else:
             student_topk = student_logits_scaled
             top_k_indices = None
@@ -390,12 +403,14 @@ def compute_sdpo_loss_batched(
                 continue
 
             start_pos = teacher_prompt_lens[i] - 1
-            teacher_logits_comp = teacher_logits[i, start_pos:start_pos + completion_lens[i], :]
+            teacher_logits_comp = teacher_logits[i,
+                                                 start_pos:start_pos + completion_lens[i], :]
             teacher_logits_comp = teacher_logits_comp.to(student_device)
             teacher_logits_scaled = teacher_logits_comp / hparams.temperature
 
             if top_k_indices_list[i] is not None:
-                teacher_topk = torch.gather(teacher_logits_scaled, -1, top_k_indices_list[i])
+                teacher_topk = torch.gather(
+                    teacher_logits_scaled, -1, top_k_indices_list[i])
             else:
                 teacher_topk = teacher_logits_scaled
 
@@ -420,7 +435,8 @@ def compute_sdpo_loss_batched(
         student_log_probs = F.log_softmax(student_topk, dim=-1)
         teacher_log_probs = F.log_softmax(teacher_topk, dim=-1)
 
-        kl_per_token = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+        kl_per_token = (student_probs * (student_log_probs -
+                        teacher_log_probs)).sum(dim=-1)
         total_loss = total_loss + kl_per_token.sum()
         total_tokens += completion_lens[i]
         total_kl += kl_per_token.sum().item()
@@ -450,10 +466,12 @@ def build_teacher_regen_prompt(
     """Build chat messages for teacher regeneration (feedback context + prompt, no completion)."""
     teacher_context_parts = []
     if student_attempt is not None:
-        teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempt}\n```")
+        teacher_context_parts.append(
+            f"## Previous Attempt\n```python\n{student_attempt}\n```")
     teacher_context_parts.append(f"## Feedback\n{feedback}")
     teacher_context_parts.append(f"## Original Question\n{prompt}")
-    teacher_context_parts.append("Given the feedback above, provide an improved solution:")
+    teacher_context_parts.append(
+        "Given the feedback above, provide an improved solution:")
 
     return [
         {"role": "user", "content": "\n\n".join(teacher_context_parts)},
@@ -514,7 +532,8 @@ def compute_distill_on_regen_loss_batched(
     max_student_completion_len = 0
 
     for i in range(batch_size):
-        student_messages = build_student_messages(prompts[i], student_completions[i])
+        student_messages = build_student_messages(
+            prompts[i], student_completions[i])
         student_full = tokenizer.apply_chat_template(
             student_messages, tokenize=False, add_generation_prompt=False,
         )
@@ -532,7 +551,8 @@ def compute_distill_on_regen_loss_batched(
         full_len = len(tokenizer(
             student_full, truncation=True, max_length=max_seq_length, padding=False,
         ).input_ids)
-        max_student_completion_len = max(max_student_completion_len, full_len - prompt_len)
+        max_student_completion_len = max(
+            max_student_completion_len, full_len - prompt_len)
 
     # === Step 2: Batch generate with teacher (LEFT-PADDED) ===
     tokenizer.padding_side = "left"
@@ -587,7 +607,8 @@ def compute_distill_on_regen_loss_batched(
                 if len(first_pad) > 0:
                     completion_ids = completion_ids[:first_pad[0].item()]
 
-        teacher_completion = tokenizer.decode(completion_ids, skip_special_tokens=True)
+        teacher_completion = tokenizer.decode(
+            completion_ids, skip_special_tokens=True)
         teacher_completions_text.append(teacher_completion)
         teacher_completion_lens.append(len(completion_ids))
 
@@ -607,10 +628,12 @@ def compute_distill_on_regen_loss_batched(
     for i in range(batch_size):
         teacher_context_parts = []
         if student_attempts[i] is not None:
-            teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempts[i]}\n```")
+            teacher_context_parts.append(
+                f"## Previous Attempt\n```python\n{student_attempts[i]}\n```")
         teacher_context_parts.append(f"## Feedback\n{feedbacks[i]}")
         teacher_context_parts.append(f"## Original Question\n{prompts[i]}")
-        teacher_context_parts.append("Given the feedback above, provide an improved solution:")
+        teacher_context_parts.append(
+            "Given the feedback above, provide an improved solution:")
         teacher_messages = [
             {"role": "user", "content": "\n\n".join(teacher_context_parts)},
             {"role": "assistant", "content": teacher_completions_text[i]},
@@ -651,8 +674,10 @@ def compute_distill_on_regen_loss_batched(
             top_k_indices_list.append(None)
             continue
 
-        student_seq_len = (student_encoding.attention_mask[i] == 1).sum().item()
-        teacher_seq_len = (teacher_encoding.attention_mask[i] == 1).sum().item()
+        student_seq_len = (
+            student_encoding.attention_mask[i] == 1).sum().item()
+        teacher_seq_len = (
+            teacher_encoding.attention_mask[i] == 1).sum().item()
         student_completion_len = student_seq_len - student_prompt_lens[i]
         teacher_completion_len = teacher_seq_len - teacher_prompt_lens[i]
         completion_len = min(student_completion_len, teacher_completion_len)
@@ -666,12 +691,14 @@ def compute_distill_on_regen_loss_batched(
         completion_lens.append(completion_len)
 
         start_pos = student_prompt_lens[i] - 1
-        student_logits_comp = student_logits[i, start_pos:start_pos + completion_len, :]
+        student_logits_comp = student_logits[i,
+                                             start_pos:start_pos + completion_len, :]
         student_logits_scaled = student_logits_comp / hparams.temperature
 
         if top_k > 0 and top_k < student_logits_scaled.shape[-1]:
             _, top_k_indices = torch.topk(student_logits_scaled, top_k, dim=-1)
-            student_topk = torch.gather(student_logits_scaled, -1, top_k_indices)
+            student_topk = torch.gather(
+                student_logits_scaled, -1, top_k_indices)
         else:
             student_topk = student_logits_scaled
             top_k_indices = None
@@ -694,12 +721,14 @@ def compute_distill_on_regen_loss_batched(
                 continue
 
             start_pos = teacher_prompt_lens[i] - 1
-            teacher_logits_comp = teacher_logits[i, start_pos:start_pos + completion_lens[i], :]
+            teacher_logits_comp = teacher_logits[i,
+                                                 start_pos:start_pos + completion_lens[i], :]
             teacher_logits_comp = teacher_logits_comp.to(student_device)
             teacher_logits_scaled = teacher_logits_comp / hparams.temperature
 
             if top_k_indices_list[i] is not None:
-                teacher_topk = torch.gather(teacher_logits_scaled, -1, top_k_indices_list[i])
+                teacher_topk = torch.gather(
+                    teacher_logits_scaled, -1, top_k_indices_list[i])
             else:
                 teacher_topk = teacher_logits_scaled
 
@@ -724,7 +753,8 @@ def compute_distill_on_regen_loss_batched(
         student_log_probs = F.log_softmax(student_topk, dim=-1)
         teacher_log_probs = F.log_softmax(teacher_topk, dim=-1)
 
-        kl_per_token = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+        kl_per_token = (student_probs * (student_log_probs -
+                        teacher_log_probs)).sum(dim=-1)
         total_loss = total_loss + kl_per_token.sum()
         total_tokens += completion_lens[i]
         total_kl += kl_per_token.sum().item()
@@ -737,7 +767,8 @@ def compute_distill_on_regen_loss_batched(
         loss = total_loss
         avg_kl = 0.0
 
-    avg_teacher_len = total_teacher_completion_len / batch_size if batch_size > 0 else 0
+    avg_teacher_len = total_teacher_completion_len / \
+        batch_size if batch_size > 0 else 0
 
     metrics = {
         "loss": loss.item(),
@@ -792,7 +823,8 @@ def sdpo_train(
     os.makedirs(output_dir, exist_ok=True)
 
     if include_prior_solutions and verify_solution_fn is None:
-        raise ValueError("verify_solution_fn is required when include_prior_solutions=True")
+        raise ValueError(
+            "verify_solution_fn is required when include_prior_solutions=True")
 
     # Initialize accelerator
     gradient_accumulation_plugin = GradientAccumulationPlugin(
@@ -820,7 +852,8 @@ def sdpo_train(
                 "regen_temperature": hparams.regen_temperature if hparams.distill_on_regen else None,
                 "include_student_attempt": hparams.include_student_attempt,
             },
-            init_kwargs={"wandb": {"name": wandb_run_name}} if wandb_run_name else {},
+            init_kwargs={"wandb": {"name": wandb_run_name}
+                         } if wandb_run_name else {},
         )
 
     # Initialize optimizer
@@ -837,7 +870,8 @@ def sdpo_train(
 
     # Prepare student model with accelerator FIRST
     # This moves the model to the correct device(s) and wraps with DDP
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    model, optimizer, dataloader = accelerator.prepare(
+        model, optimizer, dataloader)
     if scheduler is not None:
         scheduler = accelerator.prepare(scheduler)
 
@@ -860,13 +894,15 @@ def sdpo_train(
     # Log training config (main process only)
     if accelerator.is_main_process:
         logger.info(f"Initialized EMA teacher with decay={ema_decay}")
-        logger.info(f"Teacher device: {next(teacher.model.parameters()).device}")
+        logger.info(
+            f"Teacher device: {next(teacher.model.parameters()).device}")
         logger.info(f"Starting SDPO training with {hparams.num_epochs} epochs")
         logger.info(f"Teacher EMA rate: {hparams.teacher_ema_rate}")
         logger.info(f"Top-K distillation: {hparams.top_k_distillation}")
         logger.info(f"Num rollouts: {hparams.num_rollouts}")
         if hparams.distill_on_regen:
-            logger.info(f"Distill-on-regen: ENABLED (temp={hparams.regen_temperature})")
+            logger.info(
+                f"Distill-on-regen: ENABLED (temp={hparams.regen_temperature})")
         else:
             logger.info("Distill-on-regen: disabled (using standard SDPO)")
         logger.info(f"Validators: {[v.name for v, _ in validators]}")
@@ -885,9 +921,10 @@ def sdpo_train(
             # Handle batched data
             if isinstance(batch, dict):
                 if isinstance(batch.get('prompt', batch.get('question', batch.get('question_content'))), list):
-                    batch_size = len(batch.get('prompt', batch.get('question', batch.get('question_content', []))))
+                    batch_size = len(batch.get('prompt', batch.get(
+                        'question', batch.get('question_content', []))))
                     examples = [{k: v[i] if isinstance(v, list) else v for k, v in batch.items()}
-                               for i in range(batch_size)]
+                                for i in range(batch_size)]
                 else:
                     examples = [batch]
             else:
@@ -895,13 +932,15 @@ def sdpo_train(
 
             with accelerator.accumulate(model):
                 for example in examples:
-                    example_id = example.get('id', example.get('question_title', str(hash(str(example)))))
+                    example_id = example.get('id', example.get(
+                        'question_title', str(hash(str(example)))))
                     unwrapped_model = accelerator.unwrap_model(model)
 
                     # Generate multiple rollouts
                     # Disable gradient checkpointing for generation (massive speedup)
                     unwrapped_model.eval()
-                    gc_was_enabled = unwrapped_model.is_gradient_checkpointing if hasattr(unwrapped_model, 'is_gradient_checkpointing') else False
+                    gc_was_enabled = unwrapped_model.is_gradient_checkpointing if hasattr(
+                        unwrapped_model, 'is_gradient_checkpointing') else False
                     if gc_was_enabled:
                         unwrapped_model.gradient_checkpointing_disable()
 
@@ -911,6 +950,7 @@ def sdpo_train(
                         example,
                         hparams.num_rollouts,
                         hparams.rollout_temperature,
+                        hparams.max_new_tokens,
                     )
 
                     # Re-enable gradient checkpointing for training
@@ -930,7 +970,8 @@ def sdpo_train(
                         completion = rollout.completion
 
                         # Get feedback
-                        feedback_result = get_feedback_fn(prompt, completion, example)
+                        feedback_result = get_feedback_fn(
+                            prompt, completion, example)
                         feedback = feedback_result.feedback_text
 
                         # Store correct solutions
@@ -938,7 +979,8 @@ def sdpo_train(
                             if verify_solution_fn(prompt, completion, example):
                                 prior_solutions_store[example_id] = completion
 
-                        prior_solution = prior_solutions_store.get(example_id) if include_prior_solutions else None
+                        prior_solution = prior_solutions_store.get(
+                            example_id) if include_prior_solutions else None
                         student_attempt = completion if hparams.include_student_attempt else None
 
                         prompts.append(prompt)
@@ -989,7 +1031,8 @@ def sdpo_train(
                 # Gradient step
                 if accelerator.sync_gradients:
                     if hparams.max_grad_norm > 0:
-                        accelerator.clip_grad_norm_(model.parameters(), hparams.max_grad_norm)
+                        accelerator.clip_grad_norm_(
+                            model.parameters(), hparams.max_grad_norm)
 
                 optimizer.step()
                 if scheduler is not None:
@@ -1007,8 +1050,10 @@ def sdpo_train(
                 global_step += 1
 
                 # Average loss across all processes for accurate logging
-                loss_tensor = torch.tensor(batch_loss, device=accelerator.device)
-                avg_loss_tensor = accelerator.reduce(loss_tensor, reduction="mean")
+                loss_tensor = torch.tensor(
+                    batch_loss, device=accelerator.device)
+                avg_loss_tensor = accelerator.reduce(
+                    loss_tensor, reduction="mean")
                 avg_batch_loss = avg_loss_tensor.item()
 
                 total_loss += avg_batch_loss
@@ -1025,13 +1070,16 @@ def sdpo_train(
                         "train/global_step": global_step,
                     }
                     if hparams.distill_on_regen:
-                        log_dict["train/teacher_completion_len"] = batch_metrics.get('teacher_completion_len', 0)
+                        log_dict["train/teacher_completion_len"] = batch_metrics.get(
+                            'teacher_completion_len', 0)
                     accelerator.log(log_dict, step=global_step)
 
                 # Console logging (main process only)
                 if accelerator.is_main_process and (global_step % hparams.log_interval == 0 or global_step == 1):
-                    logged_avg_loss = total_loss / min(global_step, hparams.log_interval)
-                    logger.info(f"Step {global_step} | Loss: {logged_avg_loss:.4f} | LR: {lr:.2e}")
+                    logged_avg_loss = total_loss / \
+                        min(global_step, hparams.log_interval)
+                    logger.info(
+                        f"Step {global_step} | Loss: {logged_avg_loss:.4f} | LR: {lr:.2e}")
                     metrics_history['loss'].append(logged_avg_loss)
                     metrics_history['step'].append(global_step)
                     total_loss = 0.0
@@ -1051,15 +1099,18 @@ def sdpo_train(
                                 max_new_tokens=val_config.max_new_tokens,
                                 max_seq_length=val_config.max_seq_length,
                             )
-                            logger.info(f"Validator {validator.name}: {score:.4f}")
+                            logger.info(
+                                f"Validator {validator.name}: {score:.4f}")
                             validation_history[validator.name].append({
                                 'step': global_step,
                                 'score': score,
                             })
-                            accelerator.log({f"val/{validator.name}": score}, step=global_step)
+                            accelerator.log(
+                                {f"val/{validator.name}": score}, step=global_step)
 
                         except Exception as e:
-                            logger.error(f"Validator {validator.name} failed: {e}")
+                            logger.error(
+                                f"Validator {validator.name} failed: {e}")
 
                     model.train()
 
@@ -1068,7 +1119,8 @@ def sdpo_train(
 
                 # Save checkpoint
                 if global_step % hparams.save_interval == 0 and accelerator.is_main_process:
-                    checkpoint_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
+                    checkpoint_dir = os.path.join(
+                        output_dir, f"checkpoint-{global_step}")
                     os.makedirs(checkpoint_dir, exist_ok=True)
                     unwrapped_model = accelerator.unwrap_model(model)
                     unwrapped_model.save_pretrained(checkpoint_dir)
@@ -1098,10 +1150,12 @@ def sdpo_train(
                 )
                 final_scores[validator.name] = score
                 logger.info(f"Final {validator.name}: {score:.4f}")
-                accelerator.log({f"val/{validator.name}": score}, step=global_step)
+                accelerator.log(
+                    {f"val/{validator.name}": score}, step=global_step)
 
             except Exception as e:
-                logger.error(f"Final validation for {validator.name} failed: {e}")
+                logger.error(
+                    f"Final validation for {validator.name} failed: {e}")
 
         # Save final checkpoint
         final_dir = os.path.join(output_dir, "final")
