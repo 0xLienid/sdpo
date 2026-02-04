@@ -65,8 +65,12 @@ def setup_model_and_tokenizer(config: ExperimentConfig):
         config.model_name,
         torch_dtype=dtype,
         trust_remote_code=True,
-        # attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2",
     )
+
+    # Enable gradient checkpointing to reduce memory usage
+    model.gradient_checkpointing_enable()
+    logger.info("Gradient checkpointing enabled")
 
     tokenizer = AutoTokenizer.from_pretrained(
         config.model_name,
