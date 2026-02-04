@@ -11,7 +11,7 @@ import tempfile
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from decimal import Decimal
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # Canonical LiveCodeBench base imports
@@ -323,7 +323,7 @@ def run_test_cases_parallel(
     results = [None] * len(stdin_cases)
     all_passed = True
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_run_single_test_case_worker, args): args[0] for args in worker_args}
 
         for future in as_completed(futures):

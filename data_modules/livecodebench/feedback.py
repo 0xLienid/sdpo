@@ -8,7 +8,7 @@ import os
 import json
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -404,7 +404,7 @@ def get_feedback_batch_parallel(
 
     results = [None] * batch_size
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_get_feedback_worker, args): args[0] for args in worker_args}
 
         for future in as_completed(futures):
