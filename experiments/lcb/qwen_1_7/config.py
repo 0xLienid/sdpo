@@ -38,11 +38,11 @@ class ExperimentConfig:
     # Training
     num_epochs: int = 2
     batch_size: int = 1  # Question batch size
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 1
 
     # Sequence lengths
     max_prompt_length: int = 2048
-    max_response_length: int = 8192
+    max_response_length: int = 2048
 
     # SDPO loss (from paper Table 12)
     teacher_ema_rate: float = 0.01  # EMA update rate for teacher
@@ -52,7 +52,7 @@ class ExperimentConfig:
     clip_advantages: Optional[float] = None
 
     # Rollouts
-    num_rollouts: int = 8  # Number of rollouts per question
+    num_rollouts: int = 4  # Number of rollouts per question
     rollout_temperature: float = 1.0
 
     # Logging and checkpointing

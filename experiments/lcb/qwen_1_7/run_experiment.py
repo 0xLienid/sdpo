@@ -65,7 +65,7 @@ def setup_model_and_tokenizer(config: ExperimentConfig):
         config.model_name,
         torch_dtype=dtype,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
