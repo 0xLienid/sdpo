@@ -1,10 +1,11 @@
 """
 Run async SDPO experiments for Qwen3-1.7B on LiveCodeBench.
 
-Uses vLLM for inference on a subset of GPUs while training runs on the rest.
+Uses vLLM for inference on dedicated GPUs while DDP training runs on the rest.
 
-Usage:
-    uv run python -m experiments.lcb.qwen_1_7.run_async_experiment \
+Usage (8 GPUs total: 4 inference, 4 training):
+    accelerate launch --num_processes 4 \
+        -m experiments.lcb.qwen_1_7.run_async_experiment \
         --experiment env_feedback_only \
         --num-gpus 8 \
         --inference-batch-size 4 \
@@ -12,22 +13,23 @@ Usage:
         --gradient-accumulation-steps 4
 
 GPU allocation:
-    - First half of GPUs: vLLM inference server
-    - Second half of GPUs: Training with accelerate
+    - --num-gpus: Total GPUs available
+    - --inference-ratio: Fraction for inference (default 0.5)
+    - accelerate --num_processes: Should equal num_training_gpus
+
+    Example with 8 GPUs, inference_ratio=0.5:
+        - GPUs 0-3: vLLM inference server (managed by rank 0)
+        - GPUs 4-7: DDP training (4 processes)
+        - Use: accelerate launch --num_processes 4
 
 Batch size configuration:
-    - inference-batch-size: Questions processed per vLLM generation call
-    - num_rollouts (from config): Completions generated per question
+    - inference-batch-size: Questions per vLLM generation call
+    - num_rollouts (from config): Completions per question
     - training-batch-size: Completions per forward/backward pass
     - gradient-accumulation-steps: Steps before optimizer.step()
 
     Completions per inference = inference_batch_size * num_rollouts
     Effective training batch = training_batch_size * gradient_accumulation_steps
-
-Example (8 GPUs, 4 inference / 4 training):
-    --inference-batch-size 4 --training-batch-size 8 --gradient-accumulation-steps 4
-    With num_rollouts=8: generates 32 completions per inference call
-    Effective training batch: 32 completions
 """
 
 import os
