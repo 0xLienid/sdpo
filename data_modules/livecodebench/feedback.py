@@ -6,9 +6,8 @@ Provides environment feedback and outside (LLM) feedback for SDPO training.
 
 import os
 import json
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -17,7 +16,6 @@ from training.sdpo import FeedbackResult
 from data_modules.livecodebench.code_execution import (
     extract_python_code,
     run_test_cases,
-    run_test_cases_parallel,
     TestCaseResult,
 )
 
@@ -302,154 +300,3 @@ def create_feedback_fn(
                 timeout_seconds=timeout_seconds,
             )
         return feedback_fn
-
-
-def _get_feedback_worker(args: Tuple[int, str, str, Dict[str, Any], int, bool]) -> Tuple[int, FeedbackResult]:
-    """Worker function for parallel feedback collection. Returns (index, result)."""
-    idx, prompt, completion, example, timeout_seconds, use_parallel_tests = args
-
-    code = extract_python_code(completion)
-
-    public_tests_raw = example.get("public_test_cases", "[]")
-    try:
-        if isinstance(public_tests_raw, str):
-            public_tests = json.loads(public_tests_raw)
-        else:
-            public_tests = public_tests_raw
-    except json.JSONDecodeError:
-        public_tests = []
-
-    if not public_tests:
-        return idx, FeedbackResult(
-            feedback_text="No public test cases available for this problem.",
-            success=False,
-            metadata={"test_results": [], "all_passed": False},
-        )
-
-    # Use parallel test execution within this rollout if requested
-    if use_parallel_tests:
-        all_passed, test_results = run_test_cases_parallel(
-            code=code,
-            test_cases=public_tests,
-            timeout_seconds=timeout_seconds,
-        )
-    else:
-        all_passed, test_results = run_test_cases(
-            code=code,
-            test_cases=public_tests,
-            timeout_seconds=timeout_seconds,
-            stop_on_first_failure=False,
-        )
-
-    feedback_text = format_test_results(test_results)
-
-    return idx, FeedbackResult(
-        feedback_text=feedback_text,
-        success=all_passed,
-        metadata={
-            "test_results": [
-                {
-                    "input": r.input,
-                    "expected": r.expected_output,
-                    "actual": r.actual_output,
-                    "passed": r.passed,
-                    "error": r.error_message,
-                }
-                for r in test_results
-            ],
-            "all_passed": all_passed,
-            "passed_count": sum(1 for r in test_results if r.passed),
-            "total_count": len(test_results),
-        },
-    )
-
-
-def get_feedback_batch_parallel(
-    prompts: List[str],
-    completions: List[str],
-    examples: List[Dict[str, Any]],
-    timeout_seconds: int = 10,
-    max_workers: Optional[int] = None,
-    parallel_tests_per_rollout: bool = True,
-) -> List[FeedbackResult]:
-    """
-    Get feedback for multiple rollouts in parallel.
-
-    Parallelizes across rollouts. Each rollout can also parallelize its test cases
-    if parallel_tests_per_rollout is True.
-
-    Args:
-        prompts: List of prompts
-        completions: List of completions
-        examples: List of example dicts (can be same example repeated)
-        timeout_seconds: Timeout per test case
-        max_workers: Max parallel workers for rollouts (defaults to min(batch_size, 8))
-        parallel_tests_per_rollout: Whether to also parallelize test cases within each rollout
-
-    Returns:
-        List of FeedbackResults in same order as inputs
-    """
-    batch_size = len(prompts)
-    if batch_size == 0:
-        return []
-
-    if max_workers is None:
-        max_workers = min(batch_size, 8)
-
-    # Prepare worker args
-    worker_args = [
-        (i, prompts[i], completions[i], examples[i], timeout_seconds, parallel_tests_per_rollout)
-        for i in range(batch_size)
-    ]
-
-    results = [None] * batch_size
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_get_feedback_worker, args): args[0] for args in worker_args}
-
-        for future in as_completed(futures):
-            try:
-                idx, result = future.result()
-                results[idx] = result
-            except Exception as e:
-                # If worker fails, return error feedback
-                idx = futures[future]
-                results[idx] = FeedbackResult(
-                    feedback_text=f"Error collecting feedback: {str(e)}",
-                    success=False,
-                    metadata={"error": str(e)},
-                )
-
-    return results
-
-
-def create_batch_feedback_fn(
-    timeout_seconds: int = 10,
-    max_workers: Optional[int] = None,
-    parallel_tests_per_rollout: bool = True,
-):
-    """
-    Factory function to create a batch feedback function for parallel execution.
-
-    Args:
-        timeout_seconds: Timeout for test execution
-        max_workers: Max parallel workers
-        parallel_tests_per_rollout: Whether to parallelize tests within each rollout
-
-    Returns:
-        A batch feedback function that takes lists and returns list of FeedbackResults
-    """
-    def batch_feedback_fn(
-        prompts: List[str],
-        completions: List[str],
-        examples: List[Dict[str, Any]],
-    ) -> List[FeedbackResult]:
-        return get_feedback_batch_parallel(
-            prompts=prompts,
-            completions=completions,
-            examples=examples,
-            timeout_seconds=timeout_seconds,
-            max_workers=max_workers,
-            parallel_tests_per_rollout=parallel_tests_per_rollout,
-        )
-    return batch_feedback_fn

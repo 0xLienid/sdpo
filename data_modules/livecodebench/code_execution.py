@@ -11,7 +11,6 @@ import tempfile
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from decimal import Decimal
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # Canonical LiveCodeBench base imports
@@ -279,66 +278,5 @@ def run_test_cases(
     # If no stdin cases, consider it a failure
     if not saw_stdin_case:
         return False, []
-
-    return all_passed, results
-
-
-def _run_single_test_case_worker(args: Tuple[str, Dict[str, str], int]) -> Tuple[int, TestCaseResult]:
-    """Worker function for parallel test case execution. Returns (index, result)."""
-    idx, code, test_case, timeout_seconds = args[0], args[1], args[2], args[3]
-    result = run_test_case(code, test_case, timeout_seconds)
-    return idx, result
-
-
-def run_test_cases_parallel(
-    code: str,
-    test_cases: List[Dict[str, str]],
-    timeout_seconds: int = 10,
-    max_workers: Optional[int] = None,
-) -> Tuple[bool, List[TestCaseResult]]:
-    """
-    Run multiple test cases against code in parallel.
-
-    Args:
-        code: Python code to test
-        test_cases: List of test case dicts
-        timeout_seconds: Timeout per test case
-        max_workers: Max parallel workers (defaults to min(num_cases, 8))
-
-    Returns:
-        Tuple of (all_passed, list of TestCaseResults)
-    """
-    # Filter to stdin cases only
-    stdin_cases = [(i, tc) for i, tc in enumerate(test_cases) if tc.get("testtype") == "stdin"]
-
-    if not stdin_cases:
-        return False, []
-
-    if max_workers is None:
-        max_workers = min(len(stdin_cases), 8)
-
-    # Prepare args for workers
-    worker_args = [(i, code, tc, timeout_seconds) for i, tc in stdin_cases]
-
-    results = [None] * len(stdin_cases)
-    all_passed = True
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_run_single_test_case_worker, args): args[0] for args in worker_args}
-
-        for future in as_completed(futures):
-            try:
-                idx, result = future.result()
-                # Find position in results list
-                pos = next(j for j, (i, _) in enumerate(stdin_cases) if i == idx)
-                results[pos] = result
-                if not result.passed:
-                    all_passed = False
-            except Exception as e:
-                # If worker fails, mark as failed
-                all_passed = False
-
-    # Filter out any None results (shouldn't happen but be safe)
-    results = [r for r in results if r is not None]
 
     return all_passed, results

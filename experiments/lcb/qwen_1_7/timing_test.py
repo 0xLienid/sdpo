@@ -16,11 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 from training.sdpo import SDPOHparams, compute_sdpo_loss_batched, EMATeacher
 from data_modules.livecodebench import LiveCodeBenchDataset, livecodebench_rollout
-from data_modules.livecodebench.feedback import (
-    create_feedback_fn,
-    create_batch_feedback_fn,
-    get_feedback_batch_parallel,
-)
+from data_modules.livecodebench.feedback import create_feedback_fn
 
 
 def main():
@@ -99,44 +95,26 @@ def main():
     print(f"    Generated {len(rollouts)} rollouts in {rollout_time:.2f}s")
     print(f"    Avg completion length: {sum(len(r.completion) for r in rollouts) / len(rollouts):.0f} chars")
 
-    # ===== FEEDBACK COLLECTION (SEQUENTIAL) =====
-    print("\n[5] Collecting feedback (SEQUENTIAL)...")
+    # ===== FEEDBACK COLLECTION =====
+    print("\n[5] Collecting feedback...")
     feedback_fn = create_feedback_fn(include_outside_feedback=False)
 
     t0 = time.time()
-    feedback_results_seq = []
+    feedback_results = []
     for rollout in rollouts:
         result = feedback_fn(rollout.prompt, rollout.completion, example)
-        feedback_results_seq.append(result)
-    feedback_seq_time = time.time() - t0
+        feedback_results.append(result)
+    feedback_time = time.time() - t0
 
-    print(f"    Sequential feedback in {feedback_seq_time:.2f}s")
-    print(f"    Successes: {sum(1 for r in feedback_results_seq if r.success)}/{len(feedback_results_seq)}")
+    print(f"    Feedback collected in {feedback_time:.2f}s")
+    print(f"    Successes: {sum(1 for r in feedback_results if r.success)}/{len(feedback_results)}")
 
-    # ===== FEEDBACK COLLECTION (PARALLEL) =====
-    print("\n[6] Collecting feedback (PARALLEL)...")
+    # ===== LOSS COMPUTATION =====
+    print("\n[6] Computing loss (batched)...")
 
     prompts = [r.prompt for r in rollouts]
     completions = [r.completion for r in rollouts]
-    examples = [example] * len(rollouts)
-
-    t0 = time.time()
-    feedback_results_par = get_feedback_batch_parallel(
-        prompts, completions, examples,
-        timeout_seconds=10,
-        max_workers=8,
-        parallel_tests_per_rollout=True,
-    )
-    feedback_par_time = time.time() - t0
-
-    print(f"    Parallel feedback in {feedback_par_time:.2f}s")
-    print(f"    Speedup: {feedback_seq_time / feedback_par_time:.2f}x")
-    print(f"    Successes: {sum(1 for r in feedback_results_par if r.success)}/{len(feedback_results_par)}")
-
-    # ===== LOSS COMPUTATION =====
-    print("\n[7] Computing loss (batched)...")
-
-    feedbacks = [r.feedback_text for r in feedback_results_par]
+    feedbacks = [r.feedback_text for r in feedback_results]
     prior_solutions = [None] * len(rollouts)
 
     t0 = time.time()
@@ -157,7 +135,7 @@ def main():
     print(f"    Completion tokens: {metrics['completion_tokens']}")
 
     # ===== BACKWARD PASS =====
-    print("\n[8] Backward pass...")
+    print("\n[7] Backward pass...")
     t0 = time.time()
     loss.backward()
     backward_time = time.time() - t0
@@ -168,15 +146,12 @@ def main():
     print("TIMING SUMMARY (single step)")
     print("=" * 60)
     print(f"  Rollout generation:     {rollout_time:>8.2f}s")
-    print(f"  Feedback (sequential):  {feedback_seq_time:>8.2f}s")
-    print(f"  Feedback (parallel):    {feedback_par_time:>8.2f}s  ({feedback_seq_time/feedback_par_time:.1f}x speedup)")
+    print(f"  Feedback collection:    {feedback_time:>8.2f}s")
     print(f"  Loss computation:       {loss_time:>8.2f}s")
     print(f"  Backward pass:          {backward_time:>8.2f}s")
     print("-" * 60)
-    total_seq = rollout_time + feedback_seq_time + loss_time + backward_time
-    total_par = rollout_time + feedback_par_time + loss_time + backward_time
-    print(f"  Total (sequential fb):  {total_seq:>8.2f}s")
-    print(f"  Total (parallel fb):    {total_par:>8.2f}s  ({total_seq/total_par:.1f}x overall speedup)")
+    total = rollout_time + feedback_time + loss_time + backward_time
+    print(f"  Total:                  {total:>8.2f}s")
     print("=" * 60)
 
 
