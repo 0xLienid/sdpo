@@ -100,6 +100,8 @@ class MMLUValidator(Validator):
                 if pred_idx == answer_idx:
                     correct += 1
 
+        model.train()
+
         accuracy = correct / total_questions
         return accuracy
 

@@ -899,7 +899,12 @@ def sdpo_train(
                     unwrapped_model = accelerator.unwrap_model(model)
 
                     # Generate multiple rollouts
+                    # Disable gradient checkpointing for generation (massive speedup)
                     unwrapped_model.eval()
+                    gc_was_enabled = unwrapped_model.is_gradient_checkpointing if hasattr(unwrapped_model, 'is_gradient_checkpointing') else False
+                    if gc_was_enabled:
+                        unwrapped_model.gradient_checkpointing_disable()
+
                     rollouts = rollout_fn(
                         unwrapped_model,
                         tokenizer,
@@ -907,6 +912,10 @@ def sdpo_train(
                         hparams.num_rollouts,
                         hparams.rollout_temperature,
                     )
+
+                    # Re-enable gradient checkpointing for training
+                    if gc_was_enabled:
+                        unwrapped_model.gradient_checkpointing_enable()
                     unwrapped_model.train()
 
                     # Collect all rollout data for batched processing

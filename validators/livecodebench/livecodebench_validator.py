@@ -143,6 +143,10 @@ class LiveCodeBenchValidator(Validator):
         print("Validating LiveCodeBench...")
 
         model.eval()
+        # Disable gradient checkpointing for inference (massive speedup)
+        gc_was_enabled = model.is_gradient_checkpointing if hasattr(model, 'is_gradient_checkpointing') else False
+        if gc_was_enabled:
+            model.gradient_checkpointing_disable()
 
         original_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
@@ -202,7 +206,10 @@ class LiveCodeBenchValidator(Validator):
                 if self.run_test_cases(code, test_cases):
                     correct += 1
 
+        # Re-enable gradient checkpointing if it was enabled
+        if gc_was_enabled:
+            model.gradient_checkpointing_enable()
         model.train()
         tokenizer.padding_side = original_padding_side
-        
+
         return correct / total_questions if total_questions > 0 else 0.0

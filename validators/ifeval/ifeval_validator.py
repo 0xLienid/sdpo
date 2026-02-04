@@ -54,6 +54,10 @@ class IFEvalValidator(Validator):
         print("Validating IFEval...")
 
         model.eval()
+        # Disable gradient checkpointing for inference (massive speedup)
+        gc_was_enabled = model.is_gradient_checkpointing if hasattr(model, 'is_gradient_checkpointing') else False
+        if gc_was_enabled:
+            model.gradient_checkpointing_disable()
 
         original_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
@@ -104,6 +108,11 @@ class IFEvalValidator(Validator):
 
                 if is_correct:
                     correct += 1
+
+        # Re-enable gradient checkpointing if it was enabled
+        if gc_was_enabled:
+            model.gradient_checkpointing_enable()
+        model.train()
 
         accuracy = correct / total_examples
         return accuracy
