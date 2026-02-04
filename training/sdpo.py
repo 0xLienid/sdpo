@@ -765,6 +765,7 @@ def sdpo_train(
     prior_solutions_store: Optional[Dict[str, str]] = None,
     wandb_project: Optional[str] = None,
     wandb_run_name: Optional[str] = None,
+    get_feedback_batch_fn: Optional[Callable[[List[str], List[str], List[Any]], List[FeedbackResult]]] = None,
 ) -> Dict[str, Any]:
     """
     SDPO Training Loop with EMA teacher and Top-K distillation.
@@ -775,7 +776,7 @@ def sdpo_train(
         dataloader: DataLoader yielding training examples
         hparams: Training hyperparameters
         rollout_fn: Function that generates N completions given (model, tokenizer, example, num_rollouts, temperature)
-        get_feedback_fn: Function that gets environment feedback
+        get_feedback_fn: Function that gets environment feedback (single item)
         validators: List of (Validator, ValidatorRunConfig) tuples
         include_prior_solutions: Whether to include prior correct solutions in teacher context
         verify_solution_fn: Function to verify if a solution is correct
@@ -785,6 +786,7 @@ def sdpo_train(
         prior_solutions_store: Optional dict of prior solutions
         wandb_project: W&B project name
         wandb_run_name: W&B run name
+        get_feedback_batch_fn: Optional batch feedback function for parallel execution
 
     Returns:
         Dictionary with training metrics and history
@@ -919,31 +921,36 @@ def sdpo_train(
                     unwrapped_model.train()
 
                     # Collect all rollout data for batched processing
-                    prompts = []
-                    completions = []
+                    prompts = [r.prompt for r in rollouts]
+                    completions = [r.completion for r in rollouts]
+
+                    # Get feedback - use batch function if available (parallel), else sequential
+                    if get_feedback_batch_fn is not None:
+                        # Parallel feedback collection
+                        examples_list = [example] * len(rollouts)
+                        feedback_results = get_feedback_batch_fn(prompts, completions, examples_list)
+                    else:
+                        # Sequential fallback
+                        feedback_results = [
+                            get_feedback_fn(prompt, completion, example)
+                            for prompt, completion in zip(prompts, completions)
+                        ]
+
                     feedbacks = []
                     prior_solutions_list = []
                     student_attempts_list = []
 
-                    for rollout in rollouts:
-                        prompt = rollout.prompt
-                        completion = rollout.completion
-
-                        # Get feedback (still sequential - involves code execution)
-                        feedback_result = get_feedback_fn(prompt, completion, example)
-                        feedback = feedback_result.feedback_text
+                    for i, feedback_result in enumerate(feedback_results):
+                        feedbacks.append(feedback_result.feedback_text)
 
                         # Store correct solutions
                         if include_prior_solutions and feedback_result.success:
-                            if verify_solution_fn(prompt, completion, example):
-                                prior_solutions_store[example_id] = completion
+                            if verify_solution_fn(prompts[i], completions[i], example):
+                                prior_solutions_store[example_id] = completions[i]
 
                         prior_solution = prior_solutions_store.get(example_id) if include_prior_solutions else None
-                        student_attempt = completion if hparams.include_student_attempt else None
+                        student_attempt = completions[i] if hparams.include_student_attempt else None
 
-                        prompts.append(prompt)
-                        completions.append(completion)
-                        feedbacks.append(feedback)
                         prior_solutions_list.append(prior_solution)
                         student_attempts_list.append(student_attempt)
 

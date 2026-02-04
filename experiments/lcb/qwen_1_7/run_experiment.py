@@ -28,7 +28,7 @@ from data_modules.livecodebench import (
     LiveCodeBenchDataset,
     livecodebench_rollout,
 )
-from data_modules.livecodebench.feedback import create_feedback_fn
+from data_modules.livecodebench.feedback import create_feedback_fn, create_batch_feedback_fn
 from data_modules.livecodebench.validation import create_verification_fn
 from validators.livecodebench.livecodebench_validator import LiveCodeBenchValidator
 from validators.mmlu.mmlu_validator import MMLUValidator
@@ -188,11 +188,17 @@ def run_experiment(
     # Setup validators
     validators = setup_validators(config)
 
-    # Setup feedback function
+    # Setup feedback functions (single and batch parallel)
     feedback_fn = create_feedback_fn(
         include_outside_feedback=config.include_outside_feedback,
         openai_api_key=openai_api_key,
         openai_model=config.openai_model,
+    )
+    # Batch feedback function for parallel test execution
+    batch_feedback_fn = create_batch_feedback_fn(
+        timeout_seconds=10,
+        max_workers=None,  # Auto-select based on batch size
+        parallel_tests_per_rollout=True,  # Also parallelize test cases within each rollout
     )
 
     # Setup verification function (for prior solutions)
@@ -243,6 +249,7 @@ def run_experiment(
         hparams=hparams,
         rollout_fn=livecodebench_rollout,
         get_feedback_fn=feedback_fn,
+        get_feedback_batch_fn=batch_feedback_fn,  # Parallel test execution
         validators=validators,
         include_prior_solutions=config.include_prior_solutions,
         verify_solution_fn=verification_fn,
