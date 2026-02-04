@@ -442,7 +442,8 @@ def main():
         config.dataset_subset_size = args.subset_size
 
     openai_api_key = args.openai_api_key or os.getenv("OPENAI_API_KEY")
-    wandb_project = args.wandb_project or os.getenv("WANDB_PROJECT", "sdpo-lcb-qwen-async")
+    # Default to None to avoid wandb/pydantic compatibility issues with Python 3.12
+    wandb_project = args.wandb_project or os.getenv("WANDB_PROJECT")
 
     run_async_experiment(
         config=config,
