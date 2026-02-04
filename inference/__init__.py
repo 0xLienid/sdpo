@@ -1,8 +1,8 @@
 """
-Inference module for async SDPO training with vLLM.
+Inference module for vLLM server.
+
+Usage:
+    # Start server
+    CUDA_VISIBLE_DEVICES=0,1 uv run python -m inference.start_server \
+        --model Qwen/Qwen3-1.7B --port 8000
 """
-
-from inference.vllm_client import VLLMInferenceClient
-from inference.completion_queue import CompletionQueue, CompletionBatch
-
-__all__ = ["VLLMInferenceClient", "CompletionQueue", "CompletionBatch"]
