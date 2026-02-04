@@ -16,4 +16,6 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "immutabledict>=4.2.2",
     "nltk>=3.9.2",
+    "vllm>=0.8.0",
+    "requests>=2.32.0",
 ]

@@ -37,7 +37,7 @@ class ExperimentConfig:
 
     # Training
     num_epochs: int = 2
-    batch_size: int = 1  # Question batch size
+    batch_size: int = 1  # Question batch size (for sync training)
     gradient_accumulation_steps: int = 1
 
     # Sequence lengths
@@ -82,6 +82,26 @@ class ExperimentConfig:
 
     # Output
     output_dir: str = "outputs"
+
+    # ===== Async training settings (for vLLM-based async training) =====
+    # These are used by run_async_experiment.py. Can be overridden via CLI args.
+
+    # Batch sizes for async training:
+    #   inference_batch_size * num_rollouts = completions per inference call
+    #   training_batch_size * async_gradient_accumulation_steps = effective training batch
+    inference_batch_size: int = 4  # Questions per vLLM inference call
+    training_batch_size: int = 16  # Completions per training forward/backward pass
+    async_gradient_accumulation_steps: int = 4  # GA steps for async training
+
+    # Weight sync
+    weight_sync_interval: int = 5  # Sync weights to vLLM every N gradient steps
+
+    # vLLM settings
+    vllm_port: int = 8000
+    vllm_gpu_memory_utilization: float = 0.9
+
+    # Queue settings
+    completion_queue_size: int = 1000
 
 
 # Experiment 1: Environment feedback only
