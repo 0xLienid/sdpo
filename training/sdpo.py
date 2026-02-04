@@ -233,8 +233,8 @@ def compute_sdpo_loss_batched(
     """
     Compute the SDPO loss for a batch of rollouts with memory-efficient processing.
 
-    Processes sequences one at a time to avoid keeping full vocab-sized logits in memory.
-    Immediately extracts completion positions and reduces to top-K.
+    Uses batched forward passes but immediately extracts completion logits and
+    reduces to top-K after each forward pass to minimize memory usage.
 
     Args:
         student_model: The student model (current weights)
@@ -264,12 +264,11 @@ def compute_sdpo_loss_batched(
     if student_attempts is None:
         student_attempts = [None] * batch_size
 
-    original_padding_side = tokenizer.padding_side
-
-    # Process each sequence individually to minimize memory usage
-    total_loss = torch.tensor(0.0, device=student_device, requires_grad=True)
-    total_tokens = 0
-    total_kl = 0.0
+    # Build all sequences and track prompt lengths
+    student_fulls = []
+    teacher_fulls = []
+    student_prompt_lens = []
+    teacher_prompt_lens = []
 
     for i in range(batch_size):
         prompt = prompts[i]
@@ -278,28 +277,28 @@ def compute_sdpo_loss_batched(
         prior_solution = prior_solutions[i]
         student_attempt = student_attempts[i]
 
-        # Build student sequence
+        # Student sequence
         student_messages = build_student_messages(prompt, completion)
         student_full = tokenizer.apply_chat_template(
             student_messages, tokenize=False, add_generation_prompt=False,
         )
+        student_fulls.append(student_full)
 
-        # Get student prompt length
         student_prompt_only = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=False, add_generation_prompt=True,
         )
-        student_prompt_len = len(tokenizer(
+        student_prompt_lens.append(len(tokenizer(
             student_prompt_only, truncation=True, max_length=max_seq_length, padding=False,
-        ).input_ids)
+        ).input_ids))
 
-        # Build teacher sequence
+        # Teacher sequence
         teacher_messages = build_teacher_messages(prompt, completion, feedback, prior_solution, student_attempt)
         teacher_full = tokenizer.apply_chat_template(
             teacher_messages, tokenize=False, add_generation_prompt=False,
         )
+        teacher_fulls.append(teacher_full)
 
-        # Get teacher prompt length
         teacher_context_parts = []
         if student_attempt is not None:
             teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempt}\n```")
@@ -312,77 +311,119 @@ def compute_sdpo_loss_batched(
             [{"role": "user", "content": "\n\n".join(teacher_context_parts)}],
             tokenize=False, add_generation_prompt=True,
         )
-        teacher_prompt_len = len(tokenizer(
+        teacher_prompt_lens.append(len(tokenizer(
             teacher_prompt_only, truncation=True, max_length=max_seq_length, padding=False,
-        ).input_ids)
+        ).input_ids))
 
-        # Tokenize sequences
-        tokenizer.padding_side = "right"
-        student_encoding = tokenizer(
-            student_full, return_tensors="pt", truncation=True,
-            max_length=max_seq_length, padding=False,
-        ).to(student_device)
+    # Batch tokenize
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "right"
 
-        teacher_encoding = tokenizer(
-            teacher_full, return_tensors="pt", truncation=True,
-            max_length=max_seq_length, padding=False,
-        ).to(teacher_device)
-        tokenizer.padding_side = original_padding_side
+    student_encoding = tokenizer(
+        student_fulls, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=True,
+    ).to(student_device)
 
-        # Calculate completion lengths
-        student_seq_len = student_encoding.input_ids.shape[1]
-        teacher_seq_len = teacher_encoding.input_ids.shape[1]
-        student_completion_len = student_seq_len - student_prompt_len
-        teacher_completion_len = teacher_seq_len - teacher_prompt_len
+    teacher_encoding = tokenizer(
+        teacher_fulls, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=True,
+    ).to(teacher_device)
+
+    tokenizer.padding_side = original_padding_side
+
+    # Batched student forward pass
+    student_outputs = student_model(**student_encoding)
+    student_logits = student_outputs.logits  # (batch, seq_len, vocab)
+    del student_outputs
+
+    # Immediately extract completion logits and top-K for each sequence
+    # This reduces memory from (batch, seq_len, vocab) to (batch, completion_len, top_k)
+    student_topk_list = []
+    top_k_indices_list = []
+    completion_lens = []
+
+    for i in range(batch_size):
+        student_seq_len = (student_encoding.attention_mask[i] == 1).sum().item()
+        teacher_seq_len = (teacher_encoding.attention_mask[i] == 1).sum().item()
+        student_completion_len = student_seq_len - student_prompt_lens[i]
+        teacher_completion_len = teacher_seq_len - teacher_prompt_lens[i]
         completion_len = min(student_completion_len, teacher_completion_len)
 
         if completion_len <= 0:
+            completion_lens.append(0)
+            student_topk_list.append(None)
+            top_k_indices_list.append(None)
             continue
 
-        # Student forward pass - immediately extract completion logits and top-K
-        student_outputs = student_model(**student_encoding)
-        # Extract only completion logits (position i predicts token i+1)
-        student_logits_comp = student_outputs.logits[0, student_prompt_len-1:student_prompt_len-1+completion_len, :]
-        del student_outputs  # Free full outputs immediately
+        completion_lens.append(completion_len)
 
-        # Apply temperature and get top-K indices from student
+        # Extract completion logits for this sequence
+        start_pos = student_prompt_lens[i] - 1
+        student_logits_comp = student_logits[i, start_pos:start_pos + completion_len, :]
+
+        # Apply temperature and get top-K
         student_logits_scaled = student_logits_comp / hparams.temperature
         if top_k > 0 and top_k < student_logits_scaled.shape[-1]:
             _, top_k_indices = torch.topk(student_logits_scaled, top_k, dim=-1)
-            student_topk_logits = torch.gather(student_logits_scaled, -1, top_k_indices)
+            student_topk = torch.gather(student_logits_scaled, -1, top_k_indices)
         else:
-            student_topk_logits = student_logits_scaled
+            student_topk = student_logits_scaled
             top_k_indices = None
-        del student_logits_comp, student_logits_scaled  # Free full vocab logits
 
-        # Teacher forward pass - immediately extract and gather at student's top-K indices
-        with torch.no_grad():
-            teacher_outputs = teacher_model(**teacher_encoding)
-            teacher_logits_comp = teacher_outputs.logits[0, teacher_prompt_len-1:teacher_prompt_len-1+completion_len, :]
-            del teacher_outputs  # Free full outputs immediately
+        student_topk_list.append(student_topk)
+        top_k_indices_list.append(top_k_indices)
 
+    # Free full student logits
+    del student_logits
+
+    # Batched teacher forward pass
+    with torch.no_grad():
+        teacher_outputs = teacher_model(**teacher_encoding)
+        teacher_logits = teacher_outputs.logits
+        del teacher_outputs
+
+        # Immediately extract and gather at student's top-K indices
+        teacher_topk_list = []
+        for i in range(batch_size):
+            if completion_lens[i] <= 0:
+                teacher_topk_list.append(None)
+                continue
+
+            start_pos = teacher_prompt_lens[i] - 1
+            teacher_logits_comp = teacher_logits[i, start_pos:start_pos + completion_lens[i], :]
             teacher_logits_comp = teacher_logits_comp.to(student_device)
             teacher_logits_scaled = teacher_logits_comp / hparams.temperature
 
-            if top_k_indices is not None:
-                teacher_topk_logits = torch.gather(teacher_logits_scaled, -1, top_k_indices)
+            if top_k_indices_list[i] is not None:
+                teacher_topk = torch.gather(teacher_logits_scaled, -1, top_k_indices_list[i])
             else:
-                teacher_topk_logits = teacher_logits_scaled
-            del teacher_logits_comp, teacher_logits_scaled  # Free full vocab logits
+                teacher_topk = teacher_logits_scaled
 
-        # Compute KL divergence on reduced logits
-        student_probs = F.softmax(student_topk_logits, dim=-1)
-        student_log_probs = F.log_softmax(student_topk_logits, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_topk_logits, dim=-1)
+            teacher_topk_list.append(teacher_topk)
+
+        # Free full teacher logits
+        del teacher_logits
+
+    # Compute loss on reduced tensors
+    total_loss = torch.tensor(0.0, device=student_device, requires_grad=True)
+    total_tokens = 0
+    total_kl = 0.0
+
+    for i in range(batch_size):
+        if completion_lens[i] <= 0:
+            continue
+
+        student_topk = student_topk_list[i]
+        teacher_topk = teacher_topk_list[i]
+
+        student_probs = F.softmax(student_topk, dim=-1)
+        student_log_probs = F.log_softmax(student_topk, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_topk, dim=-1)
 
         kl_per_token = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
         total_loss = total_loss + kl_per_token.sum()
-        total_tokens += completion_len
+        total_tokens += completion_lens[i]
         total_kl += kl_per_token.sum().item()
-
-        # Clean up
-        del student_topk_logits, teacher_topk_logits, top_k_indices
-        del student_probs, student_log_probs, teacher_log_probs, kl_per_token
 
     # Average over all tokens
     if total_tokens > 0:
@@ -430,10 +471,10 @@ def compute_distill_on_regen_loss_batched(
     student_attempts: Optional[List[Optional[str]]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute the distill-on-regen loss with memory-efficient processing.
+    Compute the distill-on-regen loss with batched forward passes.
 
-    Batches teacher generation (left-padded) but processes loss computation
-    one sequence at a time to minimize memory usage.
+    Batches teacher generation and forward passes, but immediately extracts
+    completion logits and reduces to top-K after each forward pass.
 
     Args:
         student_model: The student model (current weights)
@@ -467,9 +508,18 @@ def compute_distill_on_regen_loss_batched(
 
     original_padding_side = tokenizer.padding_side
 
-    # === Step 1: Get max completion length for teacher generation ===
+    # === Step 1: Build student sequences and get prompt lengths ===
+    student_fulls = []
+    student_prompt_lens = []
     max_student_completion_len = 0
+
     for i in range(batch_size):
+        student_messages = build_student_messages(prompts[i], student_completions[i])
+        student_full = tokenizer.apply_chat_template(
+            student_messages, tokenize=False, add_generation_prompt=False,
+        )
+        student_fulls.append(student_full)
+
         student_prompt_only = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompts[i]}],
             tokenize=False, add_generation_prompt=True,
@@ -477,11 +527,8 @@ def compute_distill_on_regen_loss_batched(
         prompt_len = len(tokenizer(
             student_prompt_only, truncation=True, max_length=max_seq_length, padding=False,
         ).input_ids)
+        student_prompt_lens.append(prompt_len)
 
-        student_messages = build_student_messages(prompts[i], student_completions[i])
-        student_full = tokenizer.apply_chat_template(
-            student_messages, tokenize=False, add_generation_prompt=False,
-        )
         full_len = len(tokenizer(
             student_full, truncation=True, max_length=max_seq_length, padding=False,
         ).input_ids)
@@ -526,7 +573,7 @@ def compute_distill_on_regen_loss_batched(
 
     tokenizer.padding_side = original_padding_side
 
-    # Extract teacher completions (text only - we'll re-encode for forward pass)
+    # Extract teacher completions
     teacher_completions_text = []
     teacher_completion_lens = []
     input_len = teacher_regen_inputs.input_ids.shape[1]
@@ -544,43 +591,20 @@ def compute_distill_on_regen_loss_batched(
         teacher_completions_text.append(teacher_completion)
         teacher_completion_lens.append(len(completion_ids))
 
-    # Free generation outputs
     del teacher_outputs_gen, teacher_regen_inputs
 
-    # === Step 3: Process each sequence individually for loss computation ===
-    total_loss = torch.tensor(0.0, device=student_device, requires_grad=True)
-    total_tokens = 0
-    total_kl = 0.0
-    total_teacher_completion_len = sum(teacher_completion_lens)
+    # === Step 3: Batch tokenize student sequences ===
+    tokenizer.padding_side = "right"
+    student_encoding = tokenizer(
+        student_fulls, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=True,
+    ).to(student_device)
+
+    # === Step 4: Build and batch tokenize teacher sequences (with generated completions) ===
+    teacher_fulls = []
+    teacher_prompt_lens = []
 
     for i in range(batch_size):
-        # Skip if teacher generated nothing
-        if teacher_completion_lens[i] == 0:
-            continue
-
-        # Build and tokenize student sequence
-        student_messages = build_student_messages(prompts[i], student_completions[i])
-        student_full = tokenizer.apply_chat_template(
-            student_messages, tokenize=False, add_generation_prompt=False,
-        )
-        student_prompt_only = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompts[i]}],
-            tokenize=False, add_generation_prompt=True,
-        )
-        student_prompt_len = len(tokenizer(
-            student_prompt_only, truncation=True, max_length=max_seq_length, padding=False,
-        ).input_ids)
-
-        tokenizer.padding_side = "right"
-        student_encoding = tokenizer(
-            student_full, return_tensors="pt", truncation=True,
-            max_length=max_seq_length, padding=False,
-        ).to(student_device)
-
-        student_seq_len = student_encoding.input_ids.shape[1]
-        student_completion_len = student_seq_len - student_prompt_len
-
-        # Build and tokenize teacher sequence (with generated completion)
         teacher_context_parts = []
         if student_attempts[i] is not None:
             teacher_context_parts.append(f"## Previous Attempt\n```python\n{student_attempts[i]}\n```")
@@ -594,69 +618,116 @@ def compute_distill_on_regen_loss_batched(
         teacher_full = tokenizer.apply_chat_template(
             teacher_messages, tokenize=False, add_generation_prompt=False,
         )
+        teacher_fulls.append(teacher_full)
+
         teacher_prompt_only = tokenizer.apply_chat_template(
             [{"role": "user", "content": "\n\n".join(teacher_context_parts)}],
             tokenize=False, add_generation_prompt=True,
         )
-        teacher_prompt_len = len(tokenizer(
+        teacher_prompt_lens.append(len(tokenizer(
             teacher_prompt_only, truncation=True, max_length=max_seq_length, padding=False,
-        ).input_ids)
+        ).input_ids))
 
-        teacher_encoding = tokenizer(
-            teacher_full, return_tensors="pt", truncation=True,
-            max_length=max_seq_length, padding=False,
-        ).to(teacher_device)
-        tokenizer.padding_side = original_padding_side
+    teacher_encoding = tokenizer(
+        teacher_fulls, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=True,
+    ).to(teacher_device)
 
-        teacher_seq_len = teacher_encoding.input_ids.shape[1]
-        teacher_completion_len = teacher_seq_len - teacher_prompt_len
+    tokenizer.padding_side = original_padding_side
+
+    # === Step 5: Batched student forward pass, immediately extract and reduce ===
+    student_outputs = student_model(**student_encoding)
+    student_logits = student_outputs.logits
+    del student_outputs
+
+    student_topk_list = []
+    top_k_indices_list = []
+    completion_lens = []
+
+    for i in range(batch_size):
+        if teacher_completion_lens[i] == 0:
+            completion_lens.append(0)
+            student_topk_list.append(None)
+            top_k_indices_list.append(None)
+            continue
+
+        student_seq_len = (student_encoding.attention_mask[i] == 1).sum().item()
+        teacher_seq_len = (teacher_encoding.attention_mask[i] == 1).sum().item()
+        student_completion_len = student_seq_len - student_prompt_lens[i]
+        teacher_completion_len = teacher_seq_len - teacher_prompt_lens[i]
         completion_len = min(student_completion_len, teacher_completion_len)
 
         if completion_len <= 0:
+            completion_lens.append(0)
+            student_topk_list.append(None)
+            top_k_indices_list.append(None)
             continue
 
-        # Student forward pass - immediately extract and reduce
-        student_outputs = student_model(**student_encoding)
-        student_logits_comp = student_outputs.logits[0, student_prompt_len-1:student_prompt_len-1+completion_len, :]
-        del student_outputs
+        completion_lens.append(completion_len)
 
+        start_pos = student_prompt_lens[i] - 1
+        student_logits_comp = student_logits[i, start_pos:start_pos + completion_len, :]
         student_logits_scaled = student_logits_comp / hparams.temperature
+
         if top_k > 0 and top_k < student_logits_scaled.shape[-1]:
             _, top_k_indices = torch.topk(student_logits_scaled, top_k, dim=-1)
-            student_topk_logits = torch.gather(student_logits_scaled, -1, top_k_indices)
+            student_topk = torch.gather(student_logits_scaled, -1, top_k_indices)
         else:
-            student_topk_logits = student_logits_scaled
+            student_topk = student_logits_scaled
             top_k_indices = None
-        del student_logits_comp, student_logits_scaled
 
-        # Teacher forward pass - immediately extract and gather at student's top-K
-        with torch.no_grad():
-            teacher_outputs = teacher_model(**teacher_encoding)
-            teacher_logits_comp = teacher_outputs.logits[0, teacher_prompt_len-1:teacher_prompt_len-1+completion_len, :]
-            del teacher_outputs
+        student_topk_list.append(student_topk)
+        top_k_indices_list.append(top_k_indices)
 
+    del student_logits
+
+    # === Step 6: Batched teacher forward pass, immediately extract and reduce ===
+    with torch.no_grad():
+        teacher_outputs = teacher_model(**teacher_encoding)
+        teacher_logits = teacher_outputs.logits
+        del teacher_outputs
+
+        teacher_topk_list = []
+        for i in range(batch_size):
+            if completion_lens[i] <= 0:
+                teacher_topk_list.append(None)
+                continue
+
+            start_pos = teacher_prompt_lens[i] - 1
+            teacher_logits_comp = teacher_logits[i, start_pos:start_pos + completion_lens[i], :]
             teacher_logits_comp = teacher_logits_comp.to(student_device)
             teacher_logits_scaled = teacher_logits_comp / hparams.temperature
 
-            if top_k_indices is not None:
-                teacher_topk_logits = torch.gather(teacher_logits_scaled, -1, top_k_indices)
+            if top_k_indices_list[i] is not None:
+                teacher_topk = torch.gather(teacher_logits_scaled, -1, top_k_indices_list[i])
             else:
-                teacher_topk_logits = teacher_logits_scaled
-            del teacher_logits_comp, teacher_logits_scaled
+                teacher_topk = teacher_logits_scaled
 
-        # Compute KL divergence
-        student_probs = F.softmax(student_topk_logits, dim=-1)
-        student_log_probs = F.log_softmax(student_topk_logits, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_topk_logits, dim=-1)
+            teacher_topk_list.append(teacher_topk)
+
+        del teacher_logits
+
+    # === Step 7: Compute loss on reduced tensors ===
+    total_loss = torch.tensor(0.0, device=student_device, requires_grad=True)
+    total_tokens = 0
+    total_kl = 0.0
+    total_teacher_completion_len = sum(teacher_completion_lens)
+
+    for i in range(batch_size):
+        if completion_lens[i] <= 0:
+            continue
+
+        student_topk = student_topk_list[i]
+        teacher_topk = teacher_topk_list[i]
+
+        student_probs = F.softmax(student_topk, dim=-1)
+        student_log_probs = F.log_softmax(student_topk, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_topk, dim=-1)
 
         kl_per_token = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
         total_loss = total_loss + kl_per_token.sum()
-        total_tokens += completion_len
+        total_tokens += completion_lens[i]
         total_kl += kl_per_token.sum().item()
-
-        # Clean up
-        del student_topk_logits, teacher_topk_logits, top_k_indices
-        del student_probs, student_log_probs, teacher_log_probs, kl_per_token
 
     # Average over all tokens
     if total_tokens > 0:
