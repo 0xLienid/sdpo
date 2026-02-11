@@ -462,7 +462,7 @@ def build_teacher_regen_prompt(
     teacher_context_parts.append(
         f"## Feedback (from environment) for the previous attempt\n{feedback}")
     teacher_context_parts.append(
-        "Use the context above to inform your approach. Write a correct solution to the question. Put your code in a ```python{{code}}``` block.")
+        "Use the context above to inform your approach, but treat your attempt as an attempt from scratch. Do not reference the previous attempt in your solution, just use it and its feedback as guidance. Write a correct solution to the question. Put your code in a ```python{{code}}``` block.")
 
     return [
         {"role": "user", "content": "\n\n".join(teacher_context_parts)},

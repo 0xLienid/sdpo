@@ -26,7 +26,8 @@ def get_completion_logits(
         logits: (completion_len, vocab_size) logits predicting each completion token.
         prompt_len: Number of prompt tokens.
     """
-    full_messages = user_messages + [{"role": "assistant", "content": completion}]
+    full_messages = user_messages + \
+        [{"role": "assistant", "content": completion}]
     full_text = tokenizer.apply_chat_template(
         full_messages, tokenize=False, add_generation_prompt=False,
     )
@@ -94,18 +95,18 @@ def compute_topk_kl_per_position(
     return kl_per_token
 
 
-def bin_into_deciles(values: torch.Tensor) -> List[float]:
-    """Bin a 1-D tensor into 10 equal-width bins by relative position."""
+def bin_into_ventiles(values: torch.Tensor) -> List[float]:
+    """Bin a 1-D tensor into 20 equal-width bins by relative position."""
     n = len(values)
     if n == 0:
-        return [float("nan")] * 10
+        return [float("nan")] * 20
 
-    decile_means = []
-    for d in range(10):
-        start = int(d * n / 10)
-        end = int((d + 1) * n / 10)
+    ventile_means = []
+    for d in range(20):
+        start = int(d * n / 20)
+        end = int((d + 1) * n / 20)
         if start < end:
-            decile_means.append(values[start:end].mean().item())
+            ventile_means.append(values[start:end].mean().item())
         else:
-            decile_means.append(float("nan"))
-    return decile_means
+            ventile_means.append(float("nan"))
+    return ventile_means

@@ -23,7 +23,7 @@ from analysis.experiment_1_reward_on_regen import (
     generate_from_message_batches,
 )
 from analysis.utils import (
-    bin_into_deciles,
+    bin_into_ventiles,
     compute_topk_kl_per_position,
     get_completion_logits,
 )
@@ -48,7 +48,8 @@ def aggregate_deciles(
     stderrs = []
     for i in range(10):
         vals = [d[i] for d in decile_lists]
-        var = sum((v - means[i]) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
+        var = sum((v - means[i]) ** 2 for v in vals) / \
+            (n - 1) if n > 1 else 0.0
         stderrs.append(math.sqrt(var / n) if n > 0 else 0.0)
     return means, stderrs
 
@@ -119,9 +120,9 @@ def compute_rollout_kls(
         "delta_kl": delta_kl.detach().cpu(),
         "seq_len": min_len,
         "deciles": {
-            "standard": bin_into_deciles(standard_kl_trunc.detach().cpu()),
-            "regen": bin_into_deciles(regen_kl_trunc.detach().cpu()),
-            "delta": bin_into_deciles(delta_kl.detach().cpu()),
+            "standard": bin_into_ventiles(standard_kl_trunc.detach().cpu()),
+            "regen": bin_into_ventiles(regen_kl_trunc.detach().cpu()),
+            "delta": bin_into_ventiles(delta_kl.detach().cpu()),
         },
     }
 
@@ -161,7 +162,8 @@ def run_experiment_2(
     print("Experiment 2: KL Divergence Curve Over Position")
     print("=" * 60)
     print(f"Model: {model_name}")
-    print(f"Problems: {num_problems} | Rollouts: {num_rollouts} | Top-K: {top_k}")
+    print(
+        f"Problems: {num_problems} | Rollouts: {num_rollouts} | Top-K: {top_k}")
     print("=" * 60)
     print()
 
@@ -175,7 +177,8 @@ def run_experiment_2(
     model = model.cuda()
     model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -355,9 +358,11 @@ def run_experiment_2(
     try:
         import matplotlib.pyplot as plt
 
-        plot_strata = {k: v for k, v in summary.items() if v.get("count", 0) > 0}
+        plot_strata = {k: v for k,
+                       v in summary.items() if v.get("count", 0) > 0}
         num_rows = len(plot_strata)
-        fig, axes = plt.subplots(num_rows, 3, figsize=(18, 5 * num_rows), squeeze=False)
+        fig, axes = plt.subplots(num_rows, 3, figsize=(
+            18, 5 * num_rows), squeeze=False)
         decile_labels = [f"{d * 10}-{(d + 1) * 10}%" for d in range(10)]
         x = range(10)
 
@@ -369,22 +374,27 @@ def run_experiment_2(
 
             axes[row][0].bar(x, ms)
             axes[row][0].set_xticks(x)
-            axes[row][0].set_xticklabels(decile_labels, rotation=45, ha="right")
-            axes[row][0].set_title(f"Standard KL — {stratum_name} (n={data['count']})")
+            axes[row][0].set_xticklabels(
+                decile_labels, rotation=45, ha="right")
+            axes[row][0].set_title(
+                f"Standard KL — {stratum_name} (n={data['count']})")
             axes[row][0].set_ylabel("KL Divergence")
 
             axes[row][1].bar(x, mr)
             axes[row][1].set_xticks(x)
-            axes[row][1].set_xticklabels(decile_labels, rotation=45, ha="right")
+            axes[row][1].set_xticklabels(
+                decile_labels, rotation=45, ha="right")
             axes[row][1].set_title(f"Regen KL — {stratum_name}")
             axes[row][1].set_ylabel("KL Divergence")
 
             axes[row][2].bar(x, md, yerr=se, capsize=3)
             axes[row][2].set_xticks(x)
-            axes[row][2].set_xticklabels(decile_labels, rotation=45, ha="right")
+            axes[row][2].set_xticklabels(
+                decile_labels, rotation=45, ha="right")
             axes[row][2].set_title(f"Delta KL — {stratum_name}")
             axes[row][2].set_ylabel("Delta KL")
-            axes[row][2].axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
+            axes[row][2].axhline(
+                y=0, color="gray", linestyle="--", linewidth=0.5)
 
         plt.tight_layout()
         plot_path = os.path.join(output_dir, "experiment_2.png")
