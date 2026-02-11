@@ -82,9 +82,11 @@ For Experiments 3 and 4, training is done **on the same problems being evaluated
 
 **Procedure:**
 
-- For 10 LCB problems, generate 8 rollouts with the model, execute against public test cases
-- Generate 8 updated rollouts (**rollouts'**) per problem with prior attempt + execution output in context
+- For 25 LCB problems, generate 4 rollouts with the model, execute against public test cases
+- Generate 4 updated rollouts (**rollouts'**) per problem with prior attempt + execution output in context
 - Record the average reward (public test pass rate) for **rollouts'** vs **rollouts**
+
+**Results:** On average the original rollouts produced a mean reward of 0.07. Re-generating with the prior code + execution feedback increased the mean reward to 0.13. These are small numbers, but that still constitutes an 85.7% improvement. The re-generation was not completely without cost. 1 of the 100 total re-generations degraded from correct to incorrect.
 
 ### 2. KL Divergence Curve Over Position
 
