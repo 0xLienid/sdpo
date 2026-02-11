@@ -10,9 +10,10 @@ the student's own (potentially flawed) trajectory.
 import argparse
 import json
 import logging
+import math
 import os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -33,6 +34,23 @@ from data_modules.livecodebench.rollout import livecodebench_rollout
 from training.sdpo import build_teacher_messages, build_teacher_regen_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def aggregate_deciles(
+    decile_lists: List[List[float]],
+) -> Tuple[List[float], List[float]]:
+    """Compute mean and stderr for a list of decile vectors."""
+    n = len(decile_lists)
+    if n == 0:
+        return [float("nan")] * 10, [float("nan")] * 10
+
+    means = [sum(d[i] for d in decile_lists) / n for i in range(10)]
+    stderrs = []
+    for i in range(10):
+        vals = [d[i] for d in decile_lists]
+        var = sum((v - means[i]) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
+        stderrs.append(math.sqrt(var / n) if n > 0 else 0.0)
+    return means, stderrs
 
 
 def compute_rollout_kls(
@@ -108,6 +126,26 @@ def compute_rollout_kls(
     }
 
 
+def print_decile_table(
+    title: str,
+    mean_standard: List[float],
+    mean_regen: List[float],
+    mean_delta: List[float],
+    stderr_delta: List[float],
+    count: int,
+) -> None:
+    """Print a formatted decile summary table."""
+    print(f"\n{title} (n={count})")
+    print(f"{'Decile':<10} {'Std KL':<12} {'Regen KL':<12} {'Delta KL':<12} {'Stderr':<10}")
+    print("-" * 56)
+    for d in range(10):
+        pct = f"{d * 10}-{(d + 1) * 10}%"
+        print(
+            f"{pct:<10} {mean_standard[d]:<12.4f} {mean_regen[d]:<12.4f} "
+            f"{mean_delta[d]:<12.4f} {stderr_delta[d]:<10.4f}"
+        )
+
+
 def run_experiment_2(
     model_name: str = "Qwen/Qwen3-1.7B",
     num_problems: int = 10,
@@ -146,10 +184,8 @@ def run_experiment_2(
     dataset = LiveCodeBenchDataset(subset_size=num_problems)
     print(f"Loaded {len(dataset)} problems\n")
 
-    # Collect per-rollout decile results
-    all_standard_deciles: List[List[float]] = []
-    all_regen_deciles: List[List[float]] = []
-    all_delta_deciles: List[List[float]] = []
+    # Collect per-rollout results, tagged by correctness category
+    rollout_records: List[Dict[str, Any]] = []
     problem_results: List[Dict[str, Any]] = []
 
     for prob_idx in range(len(dataset)):
@@ -206,7 +242,18 @@ def run_experiment_2(
         for r_idx, (rollout, fb, regen_rollout) in enumerate(
             zip(original_rollouts, feedbacks, regen_rollouts)
         ):
-            print(f"  Computing KL for rollout {r_idx}...")
+            orig_correct = original_rewards[r_idx] == 1.0
+            regen_correct = regen_rewards[r_idx] == 1.0
+
+            if not orig_correct and regen_correct:
+                category = "incorrect_to_correct"
+            else:
+                category = "other"
+
+            print(
+                f"  Rollout {r_idx}: orig={original_rewards[r_idx]:.2f} "
+                f"regen={regen_rewards[r_idx]:.2f} [{category}] computing KL..."
+            )
             kl_result = compute_rollout_kls(
                 model, tokenizer,
                 question=question,
@@ -217,17 +264,19 @@ def run_experiment_2(
                 top_k=top_k,
             )
 
-            all_standard_deciles.append(kl_result["deciles"]["standard"])
-            all_regen_deciles.append(kl_result["deciles"]["regen"])
-            all_delta_deciles.append(kl_result["deciles"]["delta"])
-
-            rollout_kl_results.append({
+            record = {
+                "problem_idx": prob_idx,
                 "rollout_idx": r_idx,
-                "seq_len": kl_result["seq_len"],
-                "deciles": kl_result["deciles"],
                 "original_reward": original_rewards[r_idx],
                 "regen_reward": regen_rewards[r_idx],
-            })
+                "original_correct": orig_correct,
+                "regen_correct": regen_correct,
+                "category": category,
+                "seq_len": kl_result["seq_len"],
+                "deciles": kl_result["deciles"],
+            }
+            rollout_records.append(record)
+            rollout_kl_results.append(record)
 
         problem_results.append({
             "problem_idx": prob_idx,
@@ -236,54 +285,50 @@ def run_experiment_2(
             "mean_regen_reward": sum(regen_rewards) / len(regen_rewards),
             "rollouts": rollout_kl_results,
         })
-
-        # Print per-problem summary
-        prob_delta = [r["deciles"]["delta"] for r in rollout_kl_results]
-        mean_delta = [
-            sum(d[i] for d in prob_delta) / len(prob_delta)
-            for i in range(10)
-        ]
-        print(f"  Mean delta-KL by decile: {['%.4f' % v for v in mean_delta]}")
         print()
 
-    # Aggregate across all rollouts
-    n = len(all_delta_deciles)
-    mean_standard = [sum(d[i] for d in all_standard_deciles) / n for i in range(10)]
-    mean_regen = [sum(d[i] for d in all_regen_deciles) / n for i in range(10)]
-    mean_delta = [sum(d[i] for d in all_delta_deciles) / n for i in range(10)]
+    # ------------------------------------------------------------------
+    # Aggregate: all rollouts, incorrect→correct, other
+    # ------------------------------------------------------------------
+    strata = {
+        "all": rollout_records,
+        "incorrect_to_correct": [r for r in rollout_records if r["category"] == "incorrect_to_correct"],
+        "other": [r for r in rollout_records if r["category"] == "other"],
+    }
 
-    # Standard error
-    import math
-    stderr_delta = []
-    for i in range(10):
-        vals = [d[i] for d in all_delta_deciles]
-        mean = mean_delta[i]
-        variance = sum((v - mean) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
-        stderr_delta.append(math.sqrt(variance / n) if n > 0 else 0.0)
+    summary: Dict[str, Any] = {}
+    print("=" * 60)
+    for stratum_name, records in strata.items():
+        if not records:
+            summary[stratum_name] = {"count": 0}
+            continue
 
-    # Print summary
-    print("=" * 60)
-    print("SUMMARY: Mean KL by Decile (averaged over all rollouts)")
-    print("=" * 60)
-    print(f"{'Decile':<10} {'Std KL':<12} {'Regen KL':<12} {'Delta KL':<12} {'Stderr':<10}")
-    print("-" * 56)
-    for d in range(10):
-        pct = f"{d * 10}-{(d + 1) * 10}%"
-        print(
-            f"{pct:<10} {mean_standard[d]:<12.4f} {mean_regen[d]:<12.4f} "
-            f"{mean_delta[d]:<12.4f} {stderr_delta[d]:<10.4f}"
+        delta_dec = [r["deciles"]["delta"] for r in records]
+        std_dec = [r["deciles"]["standard"] for r in records]
+        regen_dec = [r["deciles"]["regen"] for r in records]
+
+        mean_std, _ = aggregate_deciles(std_dec)
+        mean_regen, _ = aggregate_deciles(regen_dec)
+        mean_delta, stderr_delta = aggregate_deciles(delta_dec)
+
+        summary[stratum_name] = {
+            "count": len(records),
+            "mean_standard_kl_per_decile": mean_std,
+            "mean_regen_kl_per_decile": mean_regen,
+            "mean_delta_kl_per_decile": mean_delta,
+            "stderr_delta_kl_per_decile": stderr_delta,
+        }
+
+        print_decile_table(
+            f"SUMMARY — {stratum_name}",
+            mean_std, mean_regen, mean_delta, stderr_delta,
+            len(records),
         )
     print("=" * 60)
 
-    # Build results
-    summary = {
-        "mean_standard_kl_per_decile": mean_standard,
-        "mean_regen_kl_per_decile": mean_regen,
-        "mean_delta_kl_per_decile": mean_delta,
-        "stderr_delta_kl_per_decile": stderr_delta,
-        "num_rollouts": n,
-    }
-
+    # ------------------------------------------------------------------
+    # Save results
+    # ------------------------------------------------------------------
     results = {
         "config": {
             "model_name": model_name,
@@ -298,42 +343,48 @@ def run_experiment_2(
         "summary": summary,
     }
 
-    # Save results
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, "experiment_2.json")
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Results saved to: {json_path}")
 
-    # Plot
+    # ------------------------------------------------------------------
+    # Plot: one row per stratum, 3 columns (standard, regen, delta)
+    # ------------------------------------------------------------------
     try:
         import matplotlib.pyplot as plt
 
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        plot_strata = {k: v for k, v in summary.items() if v.get("count", 0) > 0}
+        num_rows = len(plot_strata)
+        fig, axes = plt.subplots(num_rows, 3, figsize=(18, 5 * num_rows), squeeze=False)
         decile_labels = [f"{d * 10}-{(d + 1) * 10}%" for d in range(10)]
         x = range(10)
 
-        # Standard KL
-        axes[0].bar(x, mean_standard)
-        axes[0].set_xticks(x)
-        axes[0].set_xticklabels(decile_labels, rotation=45, ha="right")
-        axes[0].set_title("Standard KL per Decile")
-        axes[0].set_ylabel("KL Divergence")
+        for row, (stratum_name, data) in enumerate(plot_strata.items()):
+            ms = data["mean_standard_kl_per_decile"]
+            mr = data["mean_regen_kl_per_decile"]
+            md = data["mean_delta_kl_per_decile"]
+            se = data["stderr_delta_kl_per_decile"]
 
-        # Regen KL
-        axes[1].bar(x, mean_regen)
-        axes[1].set_xticks(x)
-        axes[1].set_xticklabels(decile_labels, rotation=45, ha="right")
-        axes[1].set_title("Regen KL per Decile")
-        axes[1].set_ylabel("KL Divergence")
+            axes[row][0].bar(x, ms)
+            axes[row][0].set_xticks(x)
+            axes[row][0].set_xticklabels(decile_labels, rotation=45, ha="right")
+            axes[row][0].set_title(f"Standard KL — {stratum_name} (n={data['count']})")
+            axes[row][0].set_ylabel("KL Divergence")
 
-        # Delta KL with error bars
-        axes[2].bar(x, mean_delta, yerr=stderr_delta, capsize=3)
-        axes[2].set_xticks(x)
-        axes[2].set_xticklabels(decile_labels, rotation=45, ha="right")
-        axes[2].set_title("Delta KL (Regen - Standard) per Decile")
-        axes[2].set_ylabel("Delta KL")
-        axes[2].axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
+            axes[row][1].bar(x, mr)
+            axes[row][1].set_xticks(x)
+            axes[row][1].set_xticklabels(decile_labels, rotation=45, ha="right")
+            axes[row][1].set_title(f"Regen KL — {stratum_name}")
+            axes[row][1].set_ylabel("KL Divergence")
+
+            axes[row][2].bar(x, md, yerr=se, capsize=3)
+            axes[row][2].set_xticks(x)
+            axes[row][2].set_xticklabels(decile_labels, rotation=45, ha="right")
+            axes[row][2].set_title(f"Delta KL — {stratum_name}")
+            axes[row][2].set_ylabel("Delta KL")
+            axes[row][2].axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
 
         plt.tight_layout()
         plot_path = os.path.join(output_dir, "experiment_2.png")

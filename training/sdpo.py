@@ -207,16 +207,17 @@ def build_teacher_messages(
 ) -> List[Dict[str, str]]:
     """Build chat messages for teacher (feedback context + prompt + completion)."""
     teacher_context_parts = []
+    teacher_context_parts.append(f"## Question\n{prompt}")
     if student_attempt is not None:
         teacher_context_parts.append(
             f"## Previous Attempt\n```python\n{student_attempt}\n```")
-    teacher_context_parts.append(f"## Feedback\n{feedback}")
+    teacher_context_parts.append(
+        f"## Feedback (from environment) for the previous attempt\n{feedback}")
     if prior_solution is not None:
         teacher_context_parts.append(
             f"## Prior Correct Solution\n```python\n{prior_solution}\n```")
-    teacher_context_parts.append(f"## Original Question\n{prompt}")
     teacher_context_parts.append(
-        "Given the feedback above, re-evaluate and improve upon the following attempt:")
+        "Use the context above to inform your approach, but treat your attempt as an attempt from scratch. Do not reference the previous attempt in your solution, just use it and its feedback as guidance. Write a correct solution to the question. Put your code in a ```python{{code}}``` block.")
 
     return [
         {"role": "user", "content": "\n\n".join(teacher_context_parts)},
@@ -305,19 +306,8 @@ def compute_sdpo_loss_batched(
         )
         teacher_fulls.append(teacher_full)
 
-        teacher_context_parts = []
-        if student_attempt is not None:
-            teacher_context_parts.append(
-                f"## Previous Attempt\n```python\n{student_attempt}\n```")
-        teacher_context_parts.append(f"## Feedback\n{feedback}")
-        if prior_solution is not None:
-            teacher_context_parts.append(
-                f"## Prior Correct Solution\n```python\n{prior_solution}\n```")
-        teacher_context_parts.append(f"## Original Question\n{prompt}")
-        teacher_context_parts.append(
-            "Given the feedback above, re-evaluate and improve upon the following attempt:")
         teacher_prompt_only = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "\n\n".join(teacher_context_parts)}],
+            [teacher_messages[0]],
             tokenize=False, add_generation_prompt=True,
         )
         teacher_prompt_lens.append(len(tokenizer(
@@ -469,9 +459,10 @@ def build_teacher_regen_prompt(
     if student_attempt is not None:
         teacher_context_parts.append(
             f"## Previous Attempt\n```python\n{student_attempt}\n```")
-    teacher_context_parts.append(f"## Feedback (from environment) for the previous attempt\n{feedback}")
     teacher_context_parts.append(
-        "Given the feedback above, attempt to re-answer the question and provide an improved solution. If the previous attempt is correct, just repeat it. Make sure to put your code in a ```python{{code}}``` block.")
+        f"## Feedback (from environment) for the previous attempt\n{feedback}")
+    teacher_context_parts.append(
+        "Use the context above to inform your approach. Write a correct solution to the question. Put your code in a ```python{{code}}``` block.")
 
     return [
         {"role": "user", "content": "\n\n".join(teacher_context_parts)},
@@ -626,25 +617,17 @@ def compute_distill_on_regen_loss_batched(
     teacher_prompt_lens = []
 
     for i in range(batch_size):
-        teacher_context_parts = []
-        if student_attempts[i] is not None:
-            teacher_context_parts.append(
-                f"## Previous Attempt\n```python\n{student_attempts[i]}\n```")
-        teacher_context_parts.append(f"## Feedback\n{feedbacks[i]}")
-        teacher_context_parts.append(f"## Original Question\n{prompts[i]}")
-        teacher_context_parts.append(
-            "Given the feedback above, provide an improved solution:")
-        teacher_messages = [
-            {"role": "user", "content": "\n\n".join(teacher_context_parts)},
-            {"role": "assistant", "content": teacher_completions_text[i]},
-        ]
+        teacher_messages = build_teacher_messages(
+            prompts[i], teacher_completions_text[i], feedbacks[i],
+            prior_solution=None, student_attempt=student_attempts[i],
+        )
         teacher_full = tokenizer.apply_chat_template(
             teacher_messages, tokenize=False, add_generation_prompt=False,
         )
         teacher_fulls.append(teacher_full)
 
         teacher_prompt_only = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "\n\n".join(teacher_context_parts)}],
+            [teacher_messages[0]],
             tokenize=False, add_generation_prompt=True,
         )
         teacher_prompt_lens.append(len(tokenizer(

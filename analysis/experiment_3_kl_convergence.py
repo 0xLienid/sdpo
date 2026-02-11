@@ -18,9 +18,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from analysis.experiment_1_reward_on_regen import (
+    compute_reward,
     generate_from_message_batches,
 )
-from analysis.experiment_2_kl_divergence import compute_rollout_kls
+from analysis.experiment_2_kl_divergence import aggregate_deciles, compute_rollout_kls
 from data_modules.livecodebench.code_execution import extract_python_code
 from data_modules.livecodebench.dataset import LiveCodeBenchDataset
 from data_modules.livecodebench.feedback import get_environment_feedback
@@ -29,21 +30,22 @@ from training.sdpo import SDPOHparams, build_teacher_regen_prompt, compute_sdpo_
 
 logger = logging.getLogger(__name__)
 
+STRATA = ["all", "incorrect_to_correct", "other"]
+
 
 def measure_delta_kl_deciles(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     rollout_data: List[Dict[str, Any]],
     top_k: int = 20,
-) -> Dict[str, Any]:
+) -> Dict[str, Dict[str, Any]]:
     """
-    Compute delta-KL per decile for all rollout pairs using the current model weights.
+    Compute delta-KL per decile for all rollout pairs, stratified by correctness.
 
-    Returns dict with per-rollout deciles and aggregated mean/stderr.
+    Returns a dict keyed by stratum name ("all", "incorrect_to_correct", "other"),
+    each containing mean/stderr decile vectors.
     """
-    all_delta_deciles: List[List[float]] = []
-    all_standard_deciles: List[List[float]] = []
-    all_regen_deciles: List[List[float]] = []
+    per_rollout: List[Dict[str, Any]] = []
 
     for item in rollout_data:
         kl_result = compute_rollout_kls(
@@ -55,28 +57,43 @@ def measure_delta_kl_deciles(
             student_code=item["student_code"],
             top_k=top_k,
         )
-        all_delta_deciles.append(kl_result["deciles"]["delta"])
-        all_standard_deciles.append(kl_result["deciles"]["standard"])
-        all_regen_deciles.append(kl_result["deciles"]["regen"])
+        per_rollout.append({
+            "category": item["category"],
+            "delta": kl_result["deciles"]["delta"],
+            "standard": kl_result["deciles"]["standard"],
+            "regen": kl_result["deciles"]["regen"],
+        })
 
-    n = len(all_delta_deciles)
-    mean_delta = [sum(d[i] for d in all_delta_deciles) / n for i in range(10)]
-    mean_standard = [sum(d[i] for d in all_standard_deciles) / n for i in range(10)]
-    mean_regen = [sum(d[i] for d in all_regen_deciles) / n for i in range(10)]
+    results: Dict[str, Dict[str, Any]] = {}
+    for stratum in STRATA:
+        if stratum == "all":
+            subset = per_rollout
+        else:
+            subset = [r for r in per_rollout if r["category"] == stratum]
 
-    stderr_delta = []
-    for i in range(10):
-        vals = [d[i] for d in all_delta_deciles]
-        var = sum((v - mean_delta[i]) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
-        stderr_delta.append(math.sqrt(var / n) if n > 0 else 0.0)
+        if not subset:
+            results[stratum] = {
+                "count": 0,
+                "mean_delta": [float("nan")] * 10,
+                "stderr_delta": [float("nan")] * 10,
+                "mean_standard": [float("nan")] * 10,
+                "mean_regen": [float("nan")] * 10,
+            }
+            continue
 
-    return {
-        "mean_delta": mean_delta,
-        "mean_standard": mean_standard,
-        "mean_regen": mean_regen,
-        "stderr_delta": stderr_delta,
-        "per_rollout_delta": all_delta_deciles,
-    }
+        mean_delta, stderr_delta = aggregate_deciles([r["delta"] for r in subset])
+        mean_std, _ = aggregate_deciles([r["standard"] for r in subset])
+        mean_regen, _ = aggregate_deciles([r["regen"] for r in subset])
+
+        results[stratum] = {
+            "count": len(subset),
+            "mean_delta": mean_delta,
+            "stderr_delta": stderr_delta,
+            "mean_standard": mean_std,
+            "mean_regen": mean_regen,
+        }
+
+    return results
 
 
 def sdpo_training_step(
@@ -181,6 +198,7 @@ def run_experiment_3(
         )
 
         feedbacks = []
+        original_rewards = []
         regen_message_batches = []
         for rollout in original_rollouts:
             fb = get_environment_feedback(
@@ -188,6 +206,7 @@ def run_experiment_3(
                 example=example,
             )
             feedbacks.append(fb)
+            original_rewards.append(compute_reward(fb))
             regen_message_batches.append(build_teacher_regen_prompt(
                 prompt=rollout.prompt,
                 feedback=fb.feedback_text,
@@ -201,16 +220,36 @@ def run_experiment_3(
             temperature=temperature, max_new_tokens=max_new_tokens,
         )
 
-        for rollout, fb, regen_rollout in zip(original_rollouts, feedbacks, regen_rollouts):
+        regen_rewards = []
+        for regen_rollout in regen_rollouts:
+            regen_fb = get_environment_feedback(
+                prompt=question, completion=regen_rollout.completion,
+                example=example,
+            )
+            regen_rewards.append(compute_reward(regen_fb))
+
+        for r_idx, (rollout, fb, regen_rollout) in enumerate(
+            zip(original_rollouts, feedbacks, regen_rollouts)
+        ):
+            orig_correct = original_rewards[r_idx] == 1.0
+            regen_correct = regen_rewards[r_idx] == 1.0
+            category = "incorrect_to_correct" if (not orig_correct and regen_correct) else "other"
+
             rollout_data.append({
                 "question": question,
                 "completion": rollout.completion,
                 "feedback_text": fb.feedback_text,
                 "regen_completion": regen_rollout.completion,
                 "student_code": extract_python_code(rollout.completion),
+                "category": category,
+                "original_reward": original_rewards[r_idx],
+                "regen_reward": regen_rewards[r_idx],
             })
 
-    print(f"\nTotal rollout pairs: {len(rollout_data)}\n")
+    counts = {s: sum(1 for r in rollout_data if r["category"] == s) for s in ["incorrect_to_correct", "other"]}
+    print(f"\nTotal rollout pairs: {len(rollout_data)}")
+    print(f"  incorrect_to_correct: {counts['incorrect_to_correct']}")
+    print(f"  other: {counts['other']}\n")
 
     # -------------------------------------------------------------------
     # Phase 2: Setup optimizer and SDPO hyperparameters
@@ -235,19 +274,27 @@ def run_experiment_3(
         # Measure delta-KL (eval mode, no dropout)
         model.eval()
         print(f"Step {step}: measuring delta-KL...")
-        metrics = measure_delta_kl_deciles(model, tokenizer, rollout_data, top_k=top_k)
+        stratified = measure_delta_kl_deciles(model, tokenizer, rollout_data, top_k=top_k)
 
-        step_record = {
-            "step": step,
-            "mean_delta_per_decile": metrics["mean_delta"],
-            "mean_standard_per_decile": metrics["mean_standard"],
-            "mean_regen_per_decile": metrics["mean_regen"],
-            "stderr_delta_per_decile": metrics["stderr_delta"],
-        }
+        step_record: Dict[str, Any] = {"step": step}
+        for stratum in STRATA:
+            data = stratified[stratum]
+            step_record[stratum] = {
+                "count": data["count"],
+                "mean_delta_per_decile": data["mean_delta"],
+                "stderr_delta_per_decile": data["stderr_delta"],
+                "mean_standard_per_decile": data["mean_standard"],
+                "mean_regen_per_decile": data["mean_regen"],
+            }
+
         steps_data.append(step_record)
 
-        delta_summary = " ".join(f"{v:.4f}" for v in metrics["mean_delta"])
-        print(f"  Delta-KL by decile: [{delta_summary}]")
+        for stratum in STRATA:
+            data = stratified[stratum]
+            if data["count"] == 0:
+                continue
+            delta_str = " ".join(f"{v:.4f}" for v in data["mean_delta"])
+            print(f"  {stratum} (n={data['count']}): [{delta_str}]")
 
         # Train (skip after last measurement)
         if step < num_training_steps:
@@ -262,17 +309,20 @@ def run_experiment_3(
     # -------------------------------------------------------------------
     # Print summary
     # -------------------------------------------------------------------
-    print("=" * 60)
-    print("SUMMARY: Delta-KL per Decile Over Training Steps")
-    print("=" * 60)
-    header = f"{'Step':<6}" + "".join(f"{'D' + str(d):<10}" for d in range(10))
-    print(header)
-    print("-" * len(header))
-    for rec in steps_data:
-        line = f"{rec['step']:<6}" + "".join(
-            f"{v:<10.4f}" for v in rec["mean_delta_per_decile"]
-        )
-        print(line)
+    for stratum in STRATA:
+        if steps_data[0][stratum]["count"] == 0:
+            continue
+        print("=" * 60)
+        print(f"SUMMARY — {stratum} (n={steps_data[0][stratum]['count']})")
+        print("=" * 60)
+        header = f"{'Step':<6}" + "".join(f"{'D' + str(d):<10}" for d in range(10))
+        print(header)
+        print("-" * len(header))
+        for rec in steps_data:
+            line = f"{rec['step']:<6}" + "".join(
+                f"{v:<10.4f}" for v in rec[stratum]["mean_delta_per_decile"]
+            )
+            print(line)
     print("=" * 60)
 
     # -------------------------------------------------------------------
@@ -290,6 +340,7 @@ def run_experiment_3(
             "learning_rate": learning_rate,
             "timestamp": datetime.now().isoformat(),
         },
+        "strata_counts": counts,
         "steps": steps_data,
     }
 
@@ -300,36 +351,45 @@ def run_experiment_3(
     print(f"Results saved to: {json_path}")
 
     # -------------------------------------------------------------------
-    # Plot: one line per decile, x = step, y = delta-KL
+    # Plot: one subplot per stratum, 10 decile lines each
     # -------------------------------------------------------------------
     try:
         import matplotlib.pyplot as plt
-        import numpy as np
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        steps = [rec["step"] for rec in steps_data]
+        plot_strata = [s for s in STRATA if steps_data[0][s]["count"] > 0]
+        fig, axes = plt.subplots(
+            1, len(plot_strata), figsize=(10 * len(plot_strata), 6), squeeze=False,
+        )
+        steps_x = [rec["step"] for rec in steps_data]
         cmap = plt.cm.viridis
 
-        for d in range(10):
-            means = [rec["mean_delta_per_decile"][d] for rec in steps_data]
-            stderrs = [rec["stderr_delta_per_decile"][d] for rec in steps_data]
-            color = cmap(d / 9)
-            label = f"{d * 10}-{(d + 1) * 10}%"
-            ax.plot(steps, means, color=color, label=label, linewidth=1.5)
-            ax.fill_between(
-                steps,
-                [m - s for m, s in zip(means, stderrs)],
-                [m + s for m, s in zip(means, stderrs)],
-                color=color, alpha=0.15,
+        for col, stratum in enumerate(plot_strata):
+            ax = axes[0][col]
+            n = steps_data[0][stratum]["count"]
+
+            for d in range(10):
+                means = [rec[stratum]["mean_delta_per_decile"][d] for rec in steps_data]
+                stderrs = [rec[stratum]["stderr_delta_per_decile"][d] for rec in steps_data]
+                color = cmap(d / 9)
+                label = f"{d * 10}-{(d + 1) * 10}%"
+                ax.plot(steps_x, means, color=color, label=label, linewidth=1.5)
+                ax.fill_between(
+                    steps_x,
+                    [m - s for m, s in zip(means, stderrs)],
+                    [m + s for m, s in zip(means, stderrs)],
+                    color=color, alpha=0.15,
+                )
+
+            ax.set_xlabel("Training Step")
+            ax.set_ylabel("Delta KL (Regen - Standard)")
+            ax.set_title(f"{stratum} (n={n})")
+            ax.legend(
+                title="Position Decile", bbox_to_anchor=(1.02, 1), loc="upper left",
+                fontsize="small",
             )
+            ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
 
-        ax.set_xlabel("Training Step")
-        ax.set_ylabel("Delta KL (Regen - Standard)")
-        ax.set_title("Delta-KL Convergence by Decile Over SDPO Training")
-        ax.legend(title="Position Decile", bbox_to_anchor=(1.02, 1), loc="upper left")
-        ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
         plt.tight_layout()
-
         plot_path = os.path.join(output_dir, "experiment_3.png")
         plt.savefig(plot_path, dpi=150, bbox_inches="tight")
         plt.close()
