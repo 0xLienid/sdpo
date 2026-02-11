@@ -465,13 +465,13 @@ def build_teacher_regen_prompt(
 ) -> List[Dict[str, str]]:
     """Build chat messages for teacher regeneration (feedback context + prompt, no completion)."""
     teacher_context_parts = []
+    teacher_context_parts.append(f"## Question\n{prompt}")
     if student_attempt is not None:
         teacher_context_parts.append(
             f"## Previous Attempt\n```python\n{student_attempt}\n```")
-    teacher_context_parts.append(f"## Feedback\n{feedback}")
-    teacher_context_parts.append(f"## Original Question\n{prompt}")
+    teacher_context_parts.append(f"## Feedback (from environment) for the previous attempt\n{feedback}")
     teacher_context_parts.append(
-        "Given the feedback above, provide an improved solution:")
+        "Given the feedback above, attempt to re-answer the question and provide an improved solution. If the previous attempt is correct, just repeat it. Make sure to put your code in a ```python{{code}}``` block.")
 
     return [
         {"role": "user", "content": "\n\n".join(teacher_context_parts)},

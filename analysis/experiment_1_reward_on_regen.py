@@ -19,6 +19,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from data_modules.livecodebench.dataset import LiveCodeBenchDataset
 from data_modules.livecodebench.feedback import get_environment_feedback
 from data_modules.livecodebench.rollout import livecodebench_rollout
+from data_modules.livecodebench.code_execution import extract_python_code
 from training.sdpo import FeedbackResult, RolloutResult, build_teacher_regen_prompt
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,96 @@ def generate_from_messages(
     return results
 
 
+def generate_from_message_batches(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    message_batches: List[List[Dict[str, str]]],
+    temperature: float = 1.0,
+    max_new_tokens: int = 2048,
+) -> List[RolloutResult]:
+    """
+    Generate one completion per message batch in a single parallel model call.
+
+    This is used to process re-generation prompts concurrently for a problem.
+    """
+    if not message_batches:
+        return []
+
+    prompt_texts = [
+        tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        for messages in message_batches
+    ]
+
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    prompt_tokenized = tokenizer(
+        prompt_texts,
+        return_tensors="pt",
+        truncation=True,
+        max_length=4096,
+        padding=True,
+    ).to(model.device)
+
+    # Keep per-sample prompt token ids (without left padding) for parity.
+    prompt_ids_per_sample = []
+    for text in prompt_texts:
+        tokenized = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=4096,
+            padding=False,
+        ).to(model.device)
+        prompt_ids_per_sample.append(tokenized.input_ids[0].clone())
+
+    prompt_len = prompt_tokenized.input_ids.shape[1]
+
+    # Keep behavior aligned with generate_from_messages(num_rollouts=1): greedy decode.
+    do_sample = False
+
+    with torch.no_grad():
+        generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "do_sample": do_sample,
+            "num_return_sequences": 1,
+        }
+        if do_sample:
+            generation_kwargs["temperature"] = temperature
+            generation_kwargs["top_p"] = 0.95
+
+        outputs = model.generate(**prompt_tokenized, **generation_kwargs)
+
+    pad_token_id = tokenizer.pad_token_id
+    results: List[RolloutResult] = []
+    for i, messages in enumerate(message_batches):
+        completion_ids = outputs[i, prompt_len:]
+
+        if pad_token_id is not None:
+            pad_mask = completion_ids == pad_token_id
+            if pad_mask.any():
+                first_pad = pad_mask.nonzero(as_tuple=True)[0][0].item()
+                completion_ids = completion_ids[:first_pad]
+
+        completion = tokenizer.decode(completion_ids, skip_special_tokens=True)
+        user_content = messages[0]["content"] if messages else ""
+        results.append(RolloutResult(
+            prompt=user_content,
+            completion=completion,
+            prompt_ids=prompt_ids_per_sample[i],
+            completion_ids=completion_ids,
+        ))
+
+    tokenizer.padding_side = original_padding_side
+    return results
+
+
 def compute_reward(feedback_result: FeedbackResult) -> float:
     """Extract fractional pass rate from a FeedbackResult."""
     metadata = feedback_result.metadata or {}
@@ -133,7 +224,7 @@ def run_experiment_1(
         model_name,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
     )
     model = model.cuda()
     model.eval()
@@ -170,10 +261,11 @@ def run_experiment_1(
             max_new_tokens=max_new_tokens,
         )
 
-        # Collect feedback and generate regen rollouts
+        # Collect feedback and prepare regen prompts
         rollout_details = []
         problem_original_rewards = []
         problem_regen_rewards = []
+        regen_inputs = []
 
         for r_idx, rollout in enumerate(original_rollouts):
             # Get feedback on original rollout
@@ -189,18 +281,31 @@ def run_experiment_1(
             regen_messages = build_teacher_regen_prompt(
                 prompt=rollout.prompt,
                 feedback=orig_fb.feedback_text,
-                student_attempt=rollout.completion,
+                student_attempt=extract_python_code(rollout.completion),
             )
 
-            # Generate 1 regen rollout
-            print(f"  Rollout {r_idx}: original reward={orig_reward:.3f}, generating regen...")
-            regen_results = generate_from_messages(
-                model, tokenizer, regen_messages,
-                num_rollouts=1,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-            )
-            regen_rollout = regen_results[0]
+            print(f"  Rollout {r_idx}: original reward={orig_reward:.3f}, queued regen prompt")
+            regen_inputs.append({
+                "rollout": rollout,
+                "orig_fb": orig_fb,
+                "orig_reward": orig_reward,
+                "regen_messages": regen_messages,
+            })
+
+        # Generate all regen rollouts in parallel (single batched model call).
+        print(f"  Generating {len(regen_inputs)} regen rollouts in parallel...")
+        regen_rollouts = generate_from_message_batches(
+            model=model,
+            tokenizer=tokenizer,
+            message_batches=[item["regen_messages"] for item in regen_inputs],
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+        )
+
+        for r_idx, (item, regen_rollout) in enumerate(zip(regen_inputs, regen_rollouts)):
+            rollout = item["rollout"]
+            orig_fb = item["orig_fb"]
+            orig_reward = item["orig_reward"]
 
             # Get feedback on regen rollout
             regen_fb = get_environment_feedback(
@@ -312,10 +417,10 @@ if __name__ == "__main__":
         description="Experiment 1: Reward on Regeneration"
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--num-problems", type=int, default=10)
-    parser.add_argument("--num-rollouts", type=int, default=8)
+    parser.add_argument("--num-problems", type=int, default=25)
+    parser.add_argument("--num-rollouts", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument(
         "--output", type=str, default="analysis/results/experiment_1.json"
     )

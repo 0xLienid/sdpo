@@ -35,7 +35,7 @@ def livecodebench_rollout(
     """
     question = example.get("question_content", example.get("question", ""))
 
-    messages = [{"role": "user", "content": question}]
+    messages = [{"role": "user", "content": f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{question}"}]
     prompt = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
