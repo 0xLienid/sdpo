@@ -355,6 +355,47 @@ def run_experiment_3(
         print()
 
     # -------------------------------------------------------------------
+    # Compute percentage-change metrics from raw ventile data
+    # -------------------------------------------------------------------
+    for stratum in STRATA:
+        if steps_data[0][stratum]["count"] == 0:
+            continue
+
+        baseline = steps_data[0][stratum]["mean_ventiles"]
+        baseline_mean_kl = steps_data[0][stratum]["mean_kl"]
+
+        for i, rec in enumerate(steps_data):
+            s = rec[stratum]
+
+            # Cumulative % change from baseline: (KL_t - KL_0) / KL_0
+            s["cumulative_pct_ventiles"] = [
+                ((s["mean_ventiles"][d] - baseline[d]) / baseline[d] * 100.0
+                 if baseline[d] != 0 else float("nan"))
+                for d in range(NUM_VENTILES)
+            ]
+            s["cumulative_pct_mean_kl"] = (
+                (s["mean_kl"] - baseline_mean_kl) / baseline_mean_kl * 100.0
+                if baseline_mean_kl != 0 else float("nan")
+            )
+
+            # Step-over-step % change: (KL_t - KL_{t-1}) / KL_{t-1}
+            if i == 0:
+                s["step_pct_ventiles"] = [0.0] * NUM_VENTILES
+                s["step_pct_mean_kl"] = 0.0
+            else:
+                prev = steps_data[i - 1][stratum]
+                s["step_pct_ventiles"] = [
+                    ((s["mean_ventiles"][d] - prev["mean_ventiles"][d])
+                     / prev["mean_ventiles"][d] * 100.0
+                     if prev["mean_ventiles"][d] != 0 else float("nan"))
+                    for d in range(NUM_VENTILES)
+                ]
+                s["step_pct_mean_kl"] = (
+                    (s["mean_kl"] - prev["mean_kl"]) / prev["mean_kl"] * 100.0
+                    if prev["mean_kl"] != 0 else float("nan")
+                )
+
+    # -------------------------------------------------------------------
     # Print summary
     # -------------------------------------------------------------------
     for stratum in STRATA:
@@ -362,8 +403,10 @@ def run_experiment_3(
             continue
         print("=" * 80)
         print(f"SUMMARY — {stratum} (n={steps_data[0][stratum]['count']})")
-        print("-" * 80)
 
+        # Raw KL table
+        print("-" * 80)
+        print("Raw KL:")
         header = (f"{'Step':<6}{'Loss':<10}"
                   + "".join(f"{'V' + str(d):<8}" for d in range(NUM_VENTILES))
                   + f"  {'Peak':<8}{'Mean':<8}")
@@ -373,11 +416,37 @@ def run_experiment_3(
             s = rec[stratum]
             peak_v = s["peak_ventile"]
             peak_label = f"V{peak_v}" if peak_v >= 0 else "N/A"
-            # Loss is only available for steps that trained (not the final measurement)
             loss_str = f"{rec.get('loss', 0.0):<10.6f}" if "loss" in rec else f"{'':<10}"
             line = (f"{rec['step']:<6}{loss_str}"
                     + "".join(f"{v:<8.4f}" for v in s["mean_ventiles"])
                     + f"  {peak_label:<8}{s['mean_kl']:<8.4f}")
+            print(line)
+
+        # Cumulative % change table
+        print()
+        print("Cumulative % change from baseline:")
+        header = (f"{'Step':<6}"
+                  + "".join(f"{'V' + str(d):<8}" for d in range(NUM_VENTILES))
+                  + f"  {'Mean':<8}")
+        print(header)
+        print("-" * len(header))
+        for rec in steps_data:
+            s = rec[stratum]
+            line = (f"{rec['step']:<6}"
+                    + "".join(f"{v:<8.1f}" for v in s["cumulative_pct_ventiles"])
+                    + f"  {s['cumulative_pct_mean_kl']:<8.1f}")
+            print(line)
+
+        # Step-over-step % change table
+        print()
+        print("Step-over-step % change:")
+        print(header)
+        print("-" * len(header))
+        for rec in steps_data:
+            s = rec[stratum]
+            line = (f"{rec['step']:<6}"
+                    + "".join(f"{v:<8.1f}" for v in s["step_pct_ventiles"])
+                    + f"  {s['step_pct_mean_kl']:<8.1f}")
             print(line)
 
     print("=" * 80)
@@ -409,43 +478,58 @@ def run_experiment_3(
     print(f"Results saved to: {json_path}")
 
     # -------------------------------------------------------------------
-    # Plot: standard KL ventile lines over training steps, one col per stratum
+    # Plot: 3 rows (raw KL, cumulative %, step-over-step %) x strata cols
     # -------------------------------------------------------------------
     try:
         import matplotlib.pyplot as plt
 
         plot_strata = [s for s in STRATA if steps_data[0][s]["count"] > 0]
         num_cols = len(plot_strata)
+        row_configs = [
+            ("mean_ventiles", "Standard KL (nats/token)", "stderr_ventiles"),
+            ("cumulative_pct_ventiles", "Cumulative % change from baseline", None),
+            ("step_pct_ventiles", "Step-over-step % change", None),
+        ]
+        num_rows = len(row_configs)
         fig, axes = plt.subplots(
-            1, num_cols, figsize=(10 * num_cols, 6), squeeze=False,
+            num_rows, num_cols, figsize=(10 * num_cols, 6 * num_rows),
+            squeeze=False,
         )
         steps_x = [rec["step"] for rec in steps_data]
         cmap = plt.cm.viridis
 
-        for col, stratum in enumerate(plot_strata):
-            ax = axes[0][col]
-            n = steps_data[0][stratum]["count"]
+        for row, (key, ylabel, stderr_key) in enumerate(row_configs):
+            for col, stratum in enumerate(plot_strata):
+                ax = axes[row][col]
+                n = steps_data[0][stratum]["count"]
 
-            for d in range(NUM_VENTILES):
-                means = [rec[stratum]["mean_ventiles"][d] for rec in steps_data]
-                stderrs = [rec[stratum]["stderr_ventiles"][d] for rec in steps_data]
-                color = cmap(d / (NUM_VENTILES - 1))
-                label = f"{d * 5}-{(d + 1) * 5}%"
-                ax.plot(steps_x, means, color=color, label=label, linewidth=1.5)
-                ax.fill_between(
-                    steps_x,
-                    [m - s for m, s in zip(means, stderrs)],
-                    [m + s for m, s in zip(means, stderrs)],
-                    color=color, alpha=0.15,
-                )
+                for d in range(NUM_VENTILES):
+                    values = [rec[stratum][key][d] for rec in steps_data]
+                    color = cmap(d / (NUM_VENTILES - 1))
+                    label = f"{d * 5}-{(d + 1) * 5}%"
+                    ax.plot(steps_x, values, color=color, label=label, linewidth=1.5)
 
-            ax.set_xlabel("Training Step")
-            ax.set_ylabel("Standard KL (student || teacher)")
-            ax.set_title(f"{stratum} (n={n})")
-            ax.legend(
-                title="Position Ventile", bbox_to_anchor=(1.02, 1), loc="upper left",
-                fontsize="x-small", ncol=2,
-            )
+                    if stderr_key is not None:
+                        stderrs = [rec[stratum][stderr_key][d] for rec in steps_data]
+                        ax.fill_between(
+                            steps_x,
+                            [v - s for v, s in zip(values, stderrs)],
+                            [v + s for v, s in zip(values, stderrs)],
+                            color=color, alpha=0.15,
+                        )
+
+                # Add zero line for percentage-change rows
+                if row > 0:
+                    ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.8)
+
+                ax.set_xlabel("Training Step")
+                ax.set_ylabel(ylabel)
+                ax.set_title(f"{stratum} (n={n})")
+                if col == num_cols - 1:
+                    ax.legend(
+                        title="Position Ventile", bbox_to_anchor=(1.02, 1),
+                        loc="upper left", fontsize="x-small", ncol=2,
+                    )
 
         plt.tight_layout()
         plot_path = os.path.join(output_dir, "experiment_3.png")
