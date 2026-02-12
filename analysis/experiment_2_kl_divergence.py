@@ -36,18 +36,18 @@ from training.sdpo import build_teacher_messages, build_teacher_regen_prompt
 logger = logging.getLogger(__name__)
 
 
-def aggregate_deciles(
-    decile_lists: List[List[float]],
+def aggregate_ventiles(
+    ventile_lists: List[List[float]],
 ) -> Tuple[List[float], List[float]]:
-    """Compute mean and stderr for a list of decile vectors."""
-    n = len(decile_lists)
+    """Compute mean and stderr for a list of ventile vectors."""
+    n = len(ventile_lists)
     if n == 0:
-        return [float("nan")] * 10, [float("nan")] * 10
+        return [float("nan")] * 20, [float("nan")] * 20
 
-    means = [sum(d[i] for d in decile_lists) / n for i in range(10)]
+    means = [sum(d[i] for d in ventile_lists) / n for i in range(20)]
     stderrs = []
-    for i in range(10):
-        vals = [d[i] for d in decile_lists]
+    for i in range(20):
+        vals = [d[i] for d in ventile_lists]
         var = sum((v - means[i]) ** 2 for v in vals) / \
             (n - 1) if n > 1 else 0.0
         stderrs.append(math.sqrt(var / n) if n > 0 else 0.0)
@@ -69,7 +69,7 @@ def compute_rollout_kls(
     Compute per-position standard KL, regen KL, and delta-KL for one rollout pair.
 
     Returns dict with 'standard_kl', 'regen_kl', 'delta_kl' (all 1-D CPU tensors)
-    and 'deciles' dict with 'standard', 'regen', 'delta' (lists of 10 floats).
+    and 'ventiles' dict with 'standard', 'regen', 'delta' (lists of 20 floats).
     """
     # Student: model(completion | problem)
     student_msgs = [{"role": "user", "content": question}]
@@ -119,7 +119,7 @@ def compute_rollout_kls(
         "regen_kl": regen_kl_trunc.detach().cpu(),
         "delta_kl": delta_kl.detach().cpu(),
         "seq_len": min_len,
-        "deciles": {
+        "ventiles": {
             "standard": bin_into_ventiles(standard_kl_trunc.detach().cpu()),
             "regen": bin_into_ventiles(regen_kl_trunc.detach().cpu()),
             "delta": bin_into_ventiles(delta_kl.detach().cpu()),
@@ -127,7 +127,7 @@ def compute_rollout_kls(
     }
 
 
-def print_decile_table(
+def print_ventile_table(
     title: str,
     mean_standard: List[float],
     mean_regen: List[float],
@@ -135,12 +135,12 @@ def print_decile_table(
     stderr_delta: List[float],
     count: int,
 ) -> None:
-    """Print a formatted decile summary table."""
+    """Print a formatted ventile summary table."""
     print(f"\n{title} (n={count})")
-    print(f"{'Decile':<10} {'Std KL':<12} {'Regen KL':<12} {'Delta KL':<12} {'Stderr':<10}")
+    print(f"{'Ventile':<10} {'Std KL':<12} {'Regen KL':<12} {'Delta KL':<12} {'Stderr':<10}")
     print("-" * 56)
-    for d in range(10):
-        pct = f"{d * 10}-{(d + 1) * 10}%"
+    for d in range(20):
+        pct = f"{d * 5}-{(d + 1) * 5}%"
         print(
             f"{pct:<10} {mean_standard[d]:<12.4f} {mean_regen[d]:<12.4f} "
             f"{mean_delta[d]:<12.4f} {stderr_delta[d]:<10.4f}"
@@ -276,7 +276,7 @@ def run_experiment_2(
                 "regen_correct": regen_correct,
                 "category": category,
                 "seq_len": kl_result["seq_len"],
-                "deciles": kl_result["deciles"],
+                "ventiles": kl_result["ventiles"],
             }
             rollout_records.append(record)
             rollout_kl_results.append(record)
@@ -306,23 +306,23 @@ def run_experiment_2(
             summary[stratum_name] = {"count": 0}
             continue
 
-        delta_dec = [r["deciles"]["delta"] for r in records]
-        std_dec = [r["deciles"]["standard"] for r in records]
-        regen_dec = [r["deciles"]["regen"] for r in records]
+        delta_dec = [r["ventiles"]["delta"] for r in records]
+        std_dec = [r["ventiles"]["standard"] for r in records]
+        regen_dec = [r["ventiles"]["regen"] for r in records]
 
-        mean_std, _ = aggregate_deciles(std_dec)
-        mean_regen, _ = aggregate_deciles(regen_dec)
-        mean_delta, stderr_delta = aggregate_deciles(delta_dec)
+        mean_std, _ = aggregate_ventiles(std_dec)
+        mean_regen, _ = aggregate_ventiles(regen_dec)
+        mean_delta, stderr_delta = aggregate_ventiles(delta_dec)
 
         summary[stratum_name] = {
             "count": len(records),
-            "mean_standard_kl_per_decile": mean_std,
-            "mean_regen_kl_per_decile": mean_regen,
-            "mean_delta_kl_per_decile": mean_delta,
-            "stderr_delta_kl_per_decile": stderr_delta,
+            "mean_standard_kl_per_ventile": mean_std,
+            "mean_regen_kl_per_ventile": mean_regen,
+            "mean_delta_kl_per_ventile": mean_delta,
+            "stderr_delta_kl_per_ventile": stderr_delta,
         }
 
-        print_decile_table(
+        print_ventile_table(
             f"SUMMARY — {stratum_name}",
             mean_std, mean_regen, mean_delta, stderr_delta,
             len(records),
@@ -363,19 +363,19 @@ def run_experiment_2(
         num_rows = len(plot_strata)
         fig, axes = plt.subplots(num_rows, 3, figsize=(
             18, 5 * num_rows), squeeze=False)
-        decile_labels = [f"{d * 10}-{(d + 1) * 10}%" for d in range(10)]
+        ventile_labels = [f"{d * 5}-{(d + 1) * 5}%" for d in range(20)]
         x = range(10)
 
         for row, (stratum_name, data) in enumerate(plot_strata.items()):
-            ms = data["mean_standard_kl_per_decile"]
-            mr = data["mean_regen_kl_per_decile"]
-            md = data["mean_delta_kl_per_decile"]
-            se = data["stderr_delta_kl_per_decile"]
+            ms = data["mean_standard_kl_per_ventile"]
+            mr = data["mean_regen_kl_per_ventile"]
+            md = data["mean_delta_kl_per_ventile"]
+            se = data["stderr_delta_kl_per_ventile"]
 
             axes[row][0].bar(x, ms)
             axes[row][0].set_xticks(x)
             axes[row][0].set_xticklabels(
-                decile_labels, rotation=45, ha="right")
+                ventile_labels, rotation=45, ha="right")
             axes[row][0].set_title(
                 f"Standard KL — {stratum_name} (n={data['count']})")
             axes[row][0].set_ylabel("KL Divergence")
@@ -383,14 +383,14 @@ def run_experiment_2(
             axes[row][1].bar(x, mr)
             axes[row][1].set_xticks(x)
             axes[row][1].set_xticklabels(
-                decile_labels, rotation=45, ha="right")
+                ventile_labels, rotation=45, ha="right")
             axes[row][1].set_title(f"Regen KL — {stratum_name}")
             axes[row][1].set_ylabel("KL Divergence")
 
             axes[row][2].bar(x, md, yerr=se, capsize=3)
             axes[row][2].set_xticks(x)
             axes[row][2].set_xticklabels(
-                decile_labels, rotation=45, ha="right")
+                ventile_labels, rotation=45, ha="right")
             axes[row][2].set_title(f"Delta KL — {stratum_name}")
             axes[row][2].set_ylabel("Delta KL")
             axes[row][2].axhline(
@@ -412,7 +412,7 @@ if __name__ == "__main__":
         description="Experiment 2: KL Divergence Curve Over Position"
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--num-problems", type=int, default=10)
+    parser.add_argument("--num-problems", type=int, default=15)
     parser.add_argument("--num-rollouts", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
