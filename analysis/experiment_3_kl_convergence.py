@@ -26,7 +26,7 @@ from data_modules.livecodebench.code_execution import extract_python_code
 from data_modules.livecodebench.dataset import LiveCodeBenchDataset
 from data_modules.livecodebench.feedback import get_environment_feedback
 from data_modules.livecodebench.rollout import livecodebench_rollout
-from training.sdpo import SDPOHparams, build_teacher_regen_prompt, compute_sdpo_loss_batched
+from training.sdpo import EMATeacher, SDPOHparams, build_teacher_regen_prompt, compute_sdpo_loss_batched
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,7 @@ def measure_kl_ventiles(
 
 def sdpo_training_step(
     model: AutoModelForCausalLM,
+    teacher: EMATeacher,
     optimizer: torch.optim.Optimizer,
     tokenizer: AutoTokenizer,
     rollout_data: List[Dict[str, Any]],
@@ -112,8 +113,8 @@ def sdpo_training_step(
     """
     Perform one SDPO training step over all rollouts (gradient accumulation).
 
-    Uses the same model as both student and teacher: the student forward pass
-    runs with gradients, and the teacher forward pass runs under torch.no_grad().
+    Uses a separate EMA teacher model (matching the real sdpo_train loop).
+    After the optimizer step, updates the teacher via EMA.
     """
     model.train()
     optimizer.zero_grad()
@@ -124,7 +125,7 @@ def sdpo_training_step(
     for item in rollout_data:
         loss, _ = compute_sdpo_loss_batched(
             student_model=model,
-            teacher_model=model,
+            teacher_model=teacher.model,
             tokenizer=tokenizer,
             prompts=[item["question"]],
             completions=[item["completion"]],
@@ -139,6 +140,9 @@ def sdpo_training_step(
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.max_grad_norm)
     optimizer.step()
+
+    # Update EMA teacher to slowly track student
+    teacher.update(model)
 
     return total_loss / n
 
@@ -258,7 +262,7 @@ def run_experiment_3(
     print(f"  other: {counts['other']}\n")
 
     # -------------------------------------------------------------------
-    # Phase 2: Setup optimizer and SDPO hyperparameters
+    # Phase 2: Setup optimizer, EMA teacher, and SDPO hyperparameters
     # -------------------------------------------------------------------
     hparams = SDPOHparams(
         learning_rate=learning_rate,
@@ -270,6 +274,11 @@ def run_experiment_3(
         lr=learning_rate,
         weight_decay=hparams.weight_decay,
     )
+
+    # Create EMA teacher (separate model copy, matching real sdpo_train)
+    ema_decay = 1.0 - hparams.teacher_ema_rate
+    print(f"Creating EMA teacher (decay={ema_decay})...")
+    teacher = EMATeacher(model, decay=ema_decay)
 
     # -------------------------------------------------------------------
     # Phase 3: Training loop with measurement at each step
@@ -312,7 +321,7 @@ def run_experiment_3(
         if step < num_training_steps:
             print(f"Step {step}: training...")
             loss = sdpo_training_step(
-                model, optimizer, tokenizer, rollout_data, hparams,
+                model, teacher, optimizer, tokenizer, rollout_data, hparams,
             )
             print(f"  Loss: {loss:.6f}")
 
