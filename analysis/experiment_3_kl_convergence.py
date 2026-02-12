@@ -21,7 +21,7 @@ from analysis.experiment_1_reward_on_regen import (
     compute_reward,
     generate_from_message_batches,
 )
-from analysis.experiment_2_kl_divergence import aggregate_deciles, compute_rollout_kls
+from analysis.experiment_2_kl_divergence import aggregate_ventiles, compute_rollout_kls
 from data_modules.livecodebench.code_execution import extract_python_code
 from data_modules.livecodebench.dataset import LiveCodeBenchDataset
 from data_modules.livecodebench.feedback import get_environment_feedback
@@ -33,17 +33,17 @@ logger = logging.getLogger(__name__)
 STRATA = ["all", "incorrect_to_correct", "other"]
 
 
-def measure_delta_kl_deciles(
+def measure_kl_ventiles(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     rollout_data: List[Dict[str, Any]],
     top_k: int = 20,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Compute delta-KL per decile for all rollout pairs, stratified by correctness.
+    Compute KL per ventile for all rollout pairs, stratified by correctness.
 
     Returns a dict keyed by stratum name ("all", "incorrect_to_correct", "other"),
-    each containing mean/stderr decile vectors.
+    each containing mean/stderr ventile vectors and peak_standard_ventile.
     """
     per_rollout: List[Dict[str, Any]] = []
 
@@ -59,9 +59,9 @@ def measure_delta_kl_deciles(
         )
         per_rollout.append({
             "category": item["category"],
-            "delta": kl_result["deciles"]["delta"],
-            "standard": kl_result["deciles"]["standard"],
-            "regen": kl_result["deciles"]["regen"],
+            "delta": kl_result["ventiles"]["delta"],
+            "standard": kl_result["ventiles"]["standard"],
+            "regen": kl_result["ventiles"]["regen"],
         })
 
     results: Dict[str, Dict[str, Any]] = {}
@@ -74,23 +74,29 @@ def measure_delta_kl_deciles(
         if not subset:
             results[stratum] = {
                 "count": 0,
-                "mean_delta": [float("nan")] * 10,
-                "stderr_delta": [float("nan")] * 10,
-                "mean_standard": [float("nan")] * 10,
-                "mean_regen": [float("nan")] * 10,
+                "mean_delta": [float("nan")] * 20,
+                "stderr_delta": [float("nan")] * 20,
+                "mean_standard": [float("nan")] * 20,
+                "stderr_standard": [float("nan")] * 20,
+                "mean_regen": [float("nan")] * 20,
+                "peak_standard_ventile": -1,
             }
             continue
 
-        mean_delta, stderr_delta = aggregate_deciles([r["delta"] for r in subset])
-        mean_std, _ = aggregate_deciles([r["standard"] for r in subset])
-        mean_regen, _ = aggregate_deciles([r["regen"] for r in subset])
+        mean_delta, stderr_delta = aggregate_ventiles([r["delta"] for r in subset])
+        mean_std, stderr_std = aggregate_ventiles([r["standard"] for r in subset])
+        mean_regen, _ = aggregate_ventiles([r["regen"] for r in subset])
+
+        peak_ventile = max(range(20), key=lambda i: mean_std[i])
 
         results[stratum] = {
             "count": len(subset),
             "mean_delta": mean_delta,
             "stderr_delta": stderr_delta,
             "mean_standard": mean_std,
+            "stderr_standard": stderr_std,
             "mean_regen": mean_regen,
+            "peak_standard_ventile": peak_ventile,
         }
 
     return results
@@ -271,20 +277,22 @@ def run_experiment_3(
     steps_data: List[Dict[str, Any]] = []
 
     for step in range(num_training_steps + 1):
-        # Measure delta-KL (eval mode, no dropout)
+        # Measure KL (eval mode, no dropout)
         model.eval()
-        print(f"Step {step}: measuring delta-KL...")
-        stratified = measure_delta_kl_deciles(model, tokenizer, rollout_data, top_k=top_k)
+        print(f"Step {step}: measuring KL ventiles...")
+        stratified = measure_kl_ventiles(model, tokenizer, rollout_data, top_k=top_k)
 
         step_record: Dict[str, Any] = {"step": step}
         for stratum in STRATA:
             data = stratified[stratum]
             step_record[stratum] = {
                 "count": data["count"],
-                "mean_delta_per_decile": data["mean_delta"],
-                "stderr_delta_per_decile": data["stderr_delta"],
-                "mean_standard_per_decile": data["mean_standard"],
-                "mean_regen_per_decile": data["mean_regen"],
+                "mean_delta_per_ventile": data["mean_delta"],
+                "stderr_delta_per_ventile": data["stderr_delta"],
+                "mean_standard_per_ventile": data["mean_standard"],
+                "stderr_standard_per_ventile": data["stderr_standard"],
+                "mean_regen_per_ventile": data["mean_regen"],
+                "peak_standard_ventile": data["peak_standard_ventile"],
             }
 
         steps_data.append(step_record)
@@ -293,8 +301,12 @@ def run_experiment_3(
             data = stratified[stratum]
             if data["count"] == 0:
                 continue
+            peak_v = data["peak_standard_ventile"]
+            peak_pct = f"{peak_v * 5}-{(peak_v + 1) * 5}%" if peak_v >= 0 else "N/A"
+            peak_val = data["mean_standard"][peak_v] if peak_v >= 0 else float("nan")
             delta_str = " ".join(f"{v:.4f}" for v in data["mean_delta"])
-            print(f"  {stratum} (n={data['count']}): [{delta_str}]")
+            print(f"  {stratum} (n={data['count']}): delta=[{delta_str}]")
+            print(f"    peak std KL: ventile {peak_pct} = {peak_val:.4f}")
 
         # Train (skip after last measurement)
         if step < num_training_steps:
@@ -312,18 +324,36 @@ def run_experiment_3(
     for stratum in STRATA:
         if steps_data[0][stratum]["count"] == 0:
             continue
-        print("=" * 60)
+        print("=" * 80)
         print(f"SUMMARY — {stratum} (n={steps_data[0][stratum]['count']})")
-        print("=" * 60)
-        header = f"{'Step':<6}" + "".join(f"{'D' + str(d):<10}" for d in range(10))
+
+        # Delta KL table
+        print("-" * 80)
+        print("Delta KL per ventile:")
+        header = f"{'Step':<6}" + "".join(f"{'V' + str(d):<8}" for d in range(20))
         print(header)
         print("-" * len(header))
         for rec in steps_data:
             line = f"{rec['step']:<6}" + "".join(
-                f"{v:<10.4f}" for v in rec[stratum]["mean_delta_per_decile"]
+                f"{v:<8.4f}" for v in rec[stratum]["mean_delta_per_ventile"]
             )
             print(line)
-    print("=" * 60)
+
+        # Standard KL table
+        print()
+        print("Standard KL per ventile:")
+        header = f"{'Step':<6}" + "".join(f"{'V' + str(d):<8}" for d in range(20)) + f"  {'Peak':<8}"
+        print(header)
+        print("-" * len(header))
+        for rec in steps_data:
+            peak_v = rec[stratum]["peak_standard_ventile"]
+            peak_label = f"V{peak_v}" if peak_v >= 0 else "N/A"
+            line = f"{rec['step']:<6}" + "".join(
+                f"{v:<8.4f}" for v in rec[stratum]["mean_standard_per_ventile"]
+            ) + f"  {peak_label:<8}"
+            print(line)
+
+    print("=" * 80)
 
     # -------------------------------------------------------------------
     # Save results
@@ -351,27 +381,29 @@ def run_experiment_3(
     print(f"Results saved to: {json_path}")
 
     # -------------------------------------------------------------------
-    # Plot: one subplot per stratum, 10 decile lines each
+    # Plot: 2 rows (delta KL, standard KL) x N columns (one per stratum)
     # -------------------------------------------------------------------
     try:
         import matplotlib.pyplot as plt
 
         plot_strata = [s for s in STRATA if steps_data[0][s]["count"] > 0]
+        num_cols = len(plot_strata)
         fig, axes = plt.subplots(
-            1, len(plot_strata), figsize=(10 * len(plot_strata), 6), squeeze=False,
+            2, num_cols, figsize=(10 * num_cols, 12), squeeze=False,
         )
         steps_x = [rec["step"] for rec in steps_data]
         cmap = plt.cm.viridis
 
         for col, stratum in enumerate(plot_strata):
-            ax = axes[0][col]
             n = steps_data[0][stratum]["count"]
 
-            for d in range(10):
-                means = [rec[stratum]["mean_delta_per_decile"][d] for rec in steps_data]
-                stderrs = [rec[stratum]["stderr_delta_per_decile"][d] for rec in steps_data]
-                color = cmap(d / 9)
-                label = f"{d * 10}-{(d + 1) * 10}%"
+            # Row 0: Delta KL per ventile
+            ax = axes[0][col]
+            for d in range(20):
+                means = [rec[stratum]["mean_delta_per_ventile"][d] for rec in steps_data]
+                stderrs = [rec[stratum]["stderr_delta_per_ventile"][d] for rec in steps_data]
+                color = cmap(d / 19)
+                label = f"{d * 5}-{(d + 1) * 5}%"
                 ax.plot(steps_x, means, color=color, label=label, linewidth=1.5)
                 ax.fill_between(
                     steps_x,
@@ -379,15 +411,36 @@ def run_experiment_3(
                     [m + s for m, s in zip(means, stderrs)],
                     color=color, alpha=0.15,
                 )
-
             ax.set_xlabel("Training Step")
             ax.set_ylabel("Delta KL (Regen - Standard)")
-            ax.set_title(f"{stratum} (n={n})")
+            ax.set_title(f"Delta KL — {stratum} (n={n})")
             ax.legend(
-                title="Position Decile", bbox_to_anchor=(1.02, 1), loc="upper left",
-                fontsize="small",
+                title="Position Ventile", bbox_to_anchor=(1.02, 1), loc="upper left",
+                fontsize="x-small", ncol=2,
             )
             ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
+
+            # Row 1: Standard KL per ventile
+            ax = axes[1][col]
+            for d in range(20):
+                means = [rec[stratum]["mean_standard_per_ventile"][d] for rec in steps_data]
+                stderrs = [rec[stratum]["stderr_standard_per_ventile"][d] for rec in steps_data]
+                color = cmap(d / 19)
+                label = f"{d * 5}-{(d + 1) * 5}%"
+                ax.plot(steps_x, means, color=color, label=label, linewidth=1.5)
+                ax.fill_between(
+                    steps_x,
+                    [m - s for m, s in zip(means, stderrs)],
+                    [m + s for m, s in zip(means, stderrs)],
+                    color=color, alpha=0.15,
+                )
+            ax.set_xlabel("Training Step")
+            ax.set_ylabel("Standard KL")
+            ax.set_title(f"Standard KL — {stratum} (n={n})")
+            ax.legend(
+                title="Position Ventile", bbox_to_anchor=(1.02, 1), loc="upper left",
+                fontsize="x-small", ncol=2,
+            )
 
         plt.tight_layout()
         plot_path = os.path.join(output_dir, "experiment_3.png")
