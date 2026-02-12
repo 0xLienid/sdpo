@@ -1,9 +1,9 @@
 """
-Experiment 3: KL Convergence Over Position Across Training Steps
+Experiment 3: Standard KL Convergence Over Position Across Training Steps
 
-Shows that earlier token positions reduce their delta-KL faster than
-later tokens under standard SDPO training, confirming that the model
-learns from clean early signal but struggles with corrupted late signal.
+Tracks how the standard SDPO teacher-student KL (same completion, teacher has
+feedback context) evolves per-ventile across training steps using an EMA teacher.
+Shows where in the sequence the KL is highest and how it converges.
 """
 
 import argparse
@@ -12,56 +12,124 @@ import logging
 import math
 import os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from analysis.experiment_1_reward_on_regen import (
-    compute_reward,
-    generate_from_message_batches,
+from analysis.experiment_1_reward_on_regen import compute_reward
+from analysis.utils import (
+    bin_into_ventiles,
+    compute_topk_kl_per_position,
+    get_completion_logits,
 )
-from analysis.experiment_2_kl_divergence import aggregate_ventiles, compute_rollout_kls
 from data_modules.livecodebench.code_execution import extract_python_code
 from data_modules.livecodebench.dataset import LiveCodeBenchDataset
 from data_modules.livecodebench.feedback import get_environment_feedback
 from data_modules.livecodebench.rollout import livecodebench_rollout
-from training.sdpo import EMATeacher, SDPOHparams, build_teacher_regen_prompt, compute_sdpo_loss_batched
+from training.sdpo import (
+    EMATeacher,
+    SDPOHparams,
+    build_teacher_messages,
+    compute_sdpo_loss_batched,
+)
 
 logger = logging.getLogger(__name__)
 
-STRATA = ["all", "incorrect_to_correct", "other"]
+NUM_VENTILES = 20
+STRATA = ["all", "incorrect", "correct"]
 
 
-def measure_kl_ventiles(
+def aggregate_ventiles(
+    ventile_lists: List[List[float]],
+) -> Tuple[List[float], List[float]]:
+    """Compute mean and stderr for a list of ventile vectors."""
+    n = len(ventile_lists)
+    if n == 0:
+        return [float("nan")] * NUM_VENTILES, [float("nan")] * NUM_VENTILES
+
+    means = [sum(d[i] for d in ventile_lists) / n for i in range(NUM_VENTILES)]
+    stderrs = []
+    for i in range(NUM_VENTILES):
+        vals = [d[i] for d in ventile_lists]
+        var = sum((v - means[i]) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
+        stderrs.append(math.sqrt(var / n) if n > 0 else 0.0)
+    return means, stderrs
+
+
+def compute_standard_kl(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    question: str,
+    completion: str,
+    feedback_text: str,
+    student_code: str,
+    top_k: int = 20,
+    temperature: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Compute per-position standard KL for one rollout.
+
+    Standard KL = KL(student || teacher) where both evaluate the same completion,
+    student is conditioned on problem only, teacher on problem + feedback.
+
+    Returns dict with 'kl' (1-D CPU tensor), 'ventiles' (list of 20 floats),
+    and 'seq_len'.
+    """
+    student_msgs = [{"role": "user", "content": question}]
+
+    teacher_full = build_teacher_messages(
+        prompt=question, completion=completion,
+        feedback=feedback_text, prior_solution=None,
+        student_attempt=student_code,
+    )
+    teacher_msgs = [teacher_full[0]]
+
+    student_logits, _ = get_completion_logits(
+        model, tokenizer, student_msgs, completion,
+    )
+    teacher_logits, _ = get_completion_logits(
+        model, tokenizer, teacher_msgs, completion,
+    )
+
+    kl = compute_topk_kl_per_position(
+        student_logits, teacher_logits, top_k, temperature,
+    )
+
+    return {
+        "kl": kl.detach().cpu(),
+        "ventiles": bin_into_ventiles(kl.detach().cpu()),
+        "seq_len": len(kl),
+    }
+
+
+def measure_standard_kl_ventiles(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     rollout_data: List[Dict[str, Any]],
     top_k: int = 20,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Compute KL per ventile for all rollout pairs, stratified by correctness.
+    Compute standard KL per ventile for all rollouts, stratified by correctness.
 
-    Returns a dict keyed by stratum name ("all", "incorrect_to_correct", "other"),
-    each containing mean/stderr ventile vectors and peak_standard_ventile.
+    Returns a dict keyed by stratum name, each containing mean/stderr ventile
+    vectors, peak ventile index, and mean KL.
     """
     per_rollout: List[Dict[str, Any]] = []
 
     for item in rollout_data:
-        kl_result = compute_rollout_kls(
+        kl_result = compute_standard_kl(
             model, tokenizer,
             question=item["question"],
             completion=item["completion"],
             feedback_text=item["feedback_text"],
-            regen_completion=item["regen_completion"],
             student_code=item["student_code"],
             top_k=top_k,
         )
         per_rollout.append({
             "category": item["category"],
-            "delta": kl_result["ventiles"]["delta"],
-            "standard": kl_result["ventiles"]["standard"],
-            "regen": kl_result["ventiles"]["regen"],
+            "ventiles": kl_result["ventiles"],
+            "mean_kl": kl_result["kl"].mean().item() if kl_result["seq_len"] > 0 else float("nan"),
         })
 
     results: Dict[str, Dict[str, Any]] = {}
@@ -74,29 +142,23 @@ def measure_kl_ventiles(
         if not subset:
             results[stratum] = {
                 "count": 0,
-                "mean_delta": [float("nan")] * 20,
-                "stderr_delta": [float("nan")] * 20,
-                "mean_standard": [float("nan")] * 20,
-                "stderr_standard": [float("nan")] * 20,
-                "mean_regen": [float("nan")] * 20,
-                "peak_standard_ventile": -1,
+                "mean_ventiles": [float("nan")] * NUM_VENTILES,
+                "stderr_ventiles": [float("nan")] * NUM_VENTILES,
+                "peak_ventile": -1,
+                "mean_kl": float("nan"),
             }
             continue
 
-        mean_delta, stderr_delta = aggregate_ventiles([r["delta"] for r in subset])
-        mean_std, stderr_std = aggregate_ventiles([r["standard"] for r in subset])
-        mean_regen, _ = aggregate_ventiles([r["regen"] for r in subset])
-
-        peak_ventile = max(range(20), key=lambda i: mean_std[i])
+        mean_v, stderr_v = aggregate_ventiles([r["ventiles"] for r in subset])
+        peak_ventile = max(range(NUM_VENTILES), key=lambda i: mean_v[i])
+        mean_kl = sum(r["mean_kl"] for r in subset) / len(subset)
 
         results[stratum] = {
             "count": len(subset),
-            "mean_delta": mean_delta,
-            "stderr_delta": stderr_delta,
-            "mean_standard": mean_std,
-            "stderr_standard": stderr_std,
-            "mean_regen": mean_regen,
-            "peak_standard_ventile": peak_ventile,
+            "mean_ventiles": mean_v,
+            "stderr_ventiles": stderr_v,
+            "peak_ventile": peak_ventile,
+            "mean_kl": mean_kl,
         }
 
     return results
@@ -134,14 +196,12 @@ def sdpo_training_step(
             hparams=hparams,
             student_attempts=[item["student_code"]],
         )
-        # Accumulate gradients, averaging across rollouts
         (loss / n).backward()
         total_loss += loss.item()
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.max_grad_norm)
     optimizer.step()
 
-    # Update EMA teacher to slowly track student
     teacher.update(model)
 
     return total_loss / n
@@ -149,23 +209,24 @@ def sdpo_training_step(
 
 def run_experiment_3(
     model_name: str = "Qwen/Qwen3-1.7B",
-    num_problems: int = 10,
+    num_problems: int = 15,
     num_rollouts: int = 4,
     num_training_steps: int = 10,
     temperature: float = 1.0,
     max_new_tokens: int = 4096,
     top_k: int = 20,
-    learning_rate: float = 1e-6,
+    learning_rate: float = 1e-5,
     output_dir: str = "analysis/results",
 ) -> Dict[str, Any]:
-    """Run Experiment 3: KL Convergence Over Position Across Training Steps."""
+    """Run Experiment 3: Standard KL Convergence Over Position Across Training Steps."""
 
     print("=" * 60)
-    print("Experiment 3: KL Convergence Over Position")
+    print("Experiment 3: Standard KL Over Position")
     print("=" * 60)
     print(f"Model: {model_name}")
     print(f"Problems: {num_problems} | Rollouts: {num_rollouts}")
     print(f"Training steps: {num_training_steps} | LR: {learning_rate}")
+    print(f"Top-K: {top_k}")
     print("=" * 60)
     print()
 
@@ -189,7 +250,7 @@ def run_experiment_3(
     print(f"Loaded {len(dataset)} problems\n")
 
     # -------------------------------------------------------------------
-    # Phase 1: Generate all rollouts, feedback, and regen rollouts (frozen)
+    # Phase 1: Generate rollouts and collect feedback
     # -------------------------------------------------------------------
     print("Generating rollouts and collecting feedback...")
     rollout_data: List[Dict[str, Any]] = []
@@ -207,59 +268,27 @@ def run_experiment_3(
             max_new_tokens=max_new_tokens,
         )
 
-        feedbacks = []
-        original_rewards = []
-        regen_message_batches = []
         for rollout in original_rollouts:
             fb = get_environment_feedback(
                 prompt=rollout.prompt, completion=rollout.completion,
                 example=example,
             )
-            feedbacks.append(fb)
-            original_rewards.append(compute_reward(fb))
-            regen_message_batches.append(build_teacher_regen_prompt(
-                prompt=rollout.prompt,
-                feedback=fb.feedback_text,
-                student_attempt=extract_python_code(rollout.completion),
-            ))
-
-        print(f"  Problem {prob_idx}: generating {num_rollouts} regen rollouts...")
-        regen_rollouts = generate_from_message_batches(
-            model=model, tokenizer=tokenizer,
-            message_batches=regen_message_batches,
-            temperature=temperature, max_new_tokens=max_new_tokens,
-        )
-
-        regen_rewards = []
-        for regen_rollout in regen_rollouts:
-            regen_fb = get_environment_feedback(
-                prompt=question, completion=regen_rollout.completion,
-                example=example,
-            )
-            regen_rewards.append(compute_reward(regen_fb))
-
-        for r_idx, (rollout, fb, regen_rollout) in enumerate(
-            zip(original_rollouts, feedbacks, regen_rollouts)
-        ):
-            orig_correct = original_rewards[r_idx] == 1.0
-            regen_correct = regen_rewards[r_idx] == 1.0
-            category = "incorrect_to_correct" if (not orig_correct and regen_correct) else "other"
+            reward = compute_reward(fb)
+            category = "correct" if reward == 1.0 else "incorrect"
 
             rollout_data.append({
                 "question": question,
                 "completion": rollout.completion,
                 "feedback_text": fb.feedback_text,
-                "regen_completion": regen_rollout.completion,
                 "student_code": extract_python_code(rollout.completion),
                 "category": category,
-                "original_reward": original_rewards[r_idx],
-                "regen_reward": regen_rewards[r_idx],
+                "reward": reward,
             })
 
-    counts = {s: sum(1 for r in rollout_data if r["category"] == s) for s in ["incorrect_to_correct", "other"]}
-    print(f"\nTotal rollout pairs: {len(rollout_data)}")
-    print(f"  incorrect_to_correct: {counts['incorrect_to_correct']}")
-    print(f"  other: {counts['other']}\n")
+    counts = {s: sum(1 for r in rollout_data if r["category"] == s) for s in ["correct", "incorrect"]}
+    print(f"\nTotal rollouts: {len(rollout_data)}")
+    print(f"  correct: {counts['correct']}")
+    print(f"  incorrect: {counts['incorrect']}\n")
 
     # -------------------------------------------------------------------
     # Phase 2: Setup optimizer, EMA teacher, and SDPO hyperparameters
@@ -275,7 +304,6 @@ def run_experiment_3(
         weight_decay=hparams.weight_decay,
     )
 
-    # Create EMA teacher (separate model copy, matching real sdpo_train)
     ema_decay = 1.0 - hparams.teacher_ema_rate
     print(f"Creating EMA teacher (decay={ema_decay})...")
     teacher = EMATeacher(model, decay=ema_decay)
@@ -286,22 +314,21 @@ def run_experiment_3(
     steps_data: List[Dict[str, Any]] = []
 
     for step in range(num_training_steps + 1):
-        # Measure KL (eval mode, no dropout)
         model.eval()
-        print(f"Step {step}: measuring KL ventiles...")
-        stratified = measure_kl_ventiles(model, tokenizer, rollout_data, top_k=top_k)
+        print(f"Step {step}: measuring standard KL...")
+        stratified = measure_standard_kl_ventiles(
+            model, tokenizer, rollout_data, top_k=top_k,
+        )
 
         step_record: Dict[str, Any] = {"step": step}
         for stratum in STRATA:
             data = stratified[stratum]
             step_record[stratum] = {
                 "count": data["count"],
-                "mean_delta_per_ventile": data["mean_delta"],
-                "stderr_delta_per_ventile": data["stderr_delta"],
-                "mean_standard_per_ventile": data["mean_standard"],
-                "stderr_standard_per_ventile": data["stderr_standard"],
-                "mean_regen_per_ventile": data["mean_regen"],
-                "peak_standard_ventile": data["peak_standard_ventile"],
+                "mean_ventiles": data["mean_ventiles"],
+                "stderr_ventiles": data["stderr_ventiles"],
+                "peak_ventile": data["peak_ventile"],
+                "mean_kl": data["mean_kl"],
             }
 
         steps_data.append(step_record)
@@ -310,12 +337,12 @@ def run_experiment_3(
             data = stratified[stratum]
             if data["count"] == 0:
                 continue
-            peak_v = data["peak_standard_ventile"]
+            peak_v = data["peak_ventile"]
             peak_pct = f"{peak_v * 5}-{(peak_v + 1) * 5}%" if peak_v >= 0 else "N/A"
-            peak_val = data["mean_standard"][peak_v] if peak_v >= 0 else float("nan")
-            delta_str = " ".join(f"{v:.4f}" for v in data["mean_delta"])
-            print(f"  {stratum} (n={data['count']}): delta=[{delta_str}]")
-            print(f"    peak std KL: ventile {peak_pct} = {peak_val:.4f}")
+            peak_val = data["mean_ventiles"][peak_v] if peak_v >= 0 else float("nan")
+            print(f"  {stratum} (n={data['count']}): "
+                  f"mean_kl={data['mean_kl']:.4f}  "
+                  f"peak={peak_pct} ({peak_val:.4f})")
 
         # Train (skip after last measurement)
         if step < num_training_steps:
@@ -335,31 +362,22 @@ def run_experiment_3(
             continue
         print("=" * 80)
         print(f"SUMMARY — {stratum} (n={steps_data[0][stratum]['count']})")
-
-        # Delta KL table
         print("-" * 80)
-        print("Delta KL per ventile:")
-        header = f"{'Step':<6}" + "".join(f"{'V' + str(d):<8}" for d in range(20))
-        print(header)
-        print("-" * len(header))
-        for rec in steps_data:
-            line = f"{rec['step']:<6}" + "".join(
-                f"{v:<8.4f}" for v in rec[stratum]["mean_delta_per_ventile"]
-            )
-            print(line)
 
-        # Standard KL table
-        print()
-        print("Standard KL per ventile:")
-        header = f"{'Step':<6}" + "".join(f"{'V' + str(d):<8}" for d in range(20)) + f"  {'Peak':<8}"
+        header = (f"{'Step':<6}{'Loss':<10}"
+                  + "".join(f"{'V' + str(d):<8}" for d in range(NUM_VENTILES))
+                  + f"  {'Peak':<8}{'Mean':<8}")
         print(header)
         print("-" * len(header))
         for rec in steps_data:
-            peak_v = rec[stratum]["peak_standard_ventile"]
+            s = rec[stratum]
+            peak_v = s["peak_ventile"]
             peak_label = f"V{peak_v}" if peak_v >= 0 else "N/A"
-            line = f"{rec['step']:<6}" + "".join(
-                f"{v:<8.4f}" for v in rec[stratum]["mean_standard_per_ventile"]
-            ) + f"  {peak_label:<8}"
+            # Loss is only available for steps that trained (not the final measurement)
+            loss_str = f"{rec.get('loss', 0.0):<10.6f}" if "loss" in rec else f"{'':<10}"
+            line = (f"{rec['step']:<6}{loss_str}"
+                    + "".join(f"{v:<8.4f}" for v in s["mean_ventiles"])
+                    + f"  {peak_label:<8}{s['mean_kl']:<8.4f}")
             print(line)
 
     print("=" * 80)
@@ -377,6 +395,7 @@ def run_experiment_3(
             "max_new_tokens": max_new_tokens,
             "top_k": top_k,
             "learning_rate": learning_rate,
+            "ema_decay": ema_decay,
             "timestamp": datetime.now().isoformat(),
         },
         "strata_counts": counts,
@@ -390,7 +409,7 @@ def run_experiment_3(
     print(f"Results saved to: {json_path}")
 
     # -------------------------------------------------------------------
-    # Plot: 2 rows (delta KL, standard KL) x N columns (one per stratum)
+    # Plot: standard KL ventile lines over training steps, one col per stratum
     # -------------------------------------------------------------------
     try:
         import matplotlib.pyplot as plt
@@ -398,20 +417,19 @@ def run_experiment_3(
         plot_strata = [s for s in STRATA if steps_data[0][s]["count"] > 0]
         num_cols = len(plot_strata)
         fig, axes = plt.subplots(
-            2, num_cols, figsize=(10 * num_cols, 12), squeeze=False,
+            1, num_cols, figsize=(10 * num_cols, 6), squeeze=False,
         )
         steps_x = [rec["step"] for rec in steps_data]
         cmap = plt.cm.viridis
 
         for col, stratum in enumerate(plot_strata):
+            ax = axes[0][col]
             n = steps_data[0][stratum]["count"]
 
-            # Row 0: Delta KL per ventile
-            ax = axes[0][col]
-            for d in range(20):
-                means = [rec[stratum]["mean_delta_per_ventile"][d] for rec in steps_data]
-                stderrs = [rec[stratum]["stderr_delta_per_ventile"][d] for rec in steps_data]
-                color = cmap(d / 19)
+            for d in range(NUM_VENTILES):
+                means = [rec[stratum]["mean_ventiles"][d] for rec in steps_data]
+                stderrs = [rec[stratum]["stderr_ventiles"][d] for rec in steps_data]
+                color = cmap(d / (NUM_VENTILES - 1))
                 label = f"{d * 5}-{(d + 1) * 5}%"
                 ax.plot(steps_x, means, color=color, label=label, linewidth=1.5)
                 ax.fill_between(
@@ -420,32 +438,10 @@ def run_experiment_3(
                     [m + s for m, s in zip(means, stderrs)],
                     color=color, alpha=0.15,
                 )
-            ax.set_xlabel("Training Step")
-            ax.set_ylabel("Delta KL (Regen - Standard)")
-            ax.set_title(f"Delta KL — {stratum} (n={n})")
-            ax.legend(
-                title="Position Ventile", bbox_to_anchor=(1.02, 1), loc="upper left",
-                fontsize="x-small", ncol=2,
-            )
-            ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
 
-            # Row 1: Standard KL per ventile
-            ax = axes[1][col]
-            for d in range(20):
-                means = [rec[stratum]["mean_standard_per_ventile"][d] for rec in steps_data]
-                stderrs = [rec[stratum]["stderr_standard_per_ventile"][d] for rec in steps_data]
-                color = cmap(d / 19)
-                label = f"{d * 5}-{(d + 1) * 5}%"
-                ax.plot(steps_x, means, color=color, label=label, linewidth=1.5)
-                ax.fill_between(
-                    steps_x,
-                    [m - s for m, s in zip(means, stderrs)],
-                    [m + s for m, s in zip(means, stderrs)],
-                    color=color, alpha=0.15,
-                )
             ax.set_xlabel("Training Step")
-            ax.set_ylabel("Standard KL")
-            ax.set_title(f"Standard KL — {stratum} (n={n})")
+            ax.set_ylabel("Standard KL (student || teacher)")
+            ax.set_title(f"{stratum} (n={n})")
             ax.legend(
                 title="Position Ventile", bbox_to_anchor=(1.02, 1), loc="upper left",
                 fontsize="x-small", ncol=2,
@@ -464,16 +460,16 @@ def run_experiment_3(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Experiment 3: KL Convergence Over Position Across Training Steps"
+        description="Experiment 3: Standard KL Convergence Over Position"
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--num-problems", type=int, default=10)
+    parser.add_argument("--num-problems", type=int, default=15)
     parser.add_argument("--num-rollouts", type=int, default=4)
     parser.add_argument("--num-training-steps", type=int, default=10)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--output-dir", type=str, default="analysis/results")
     args = parser.parse_args()
 
