@@ -103,67 +103,6 @@ def compute_standard_kl(
     }
 
 
-def measure_standard_kl_ventiles(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    rollout_data: List[Dict[str, Any]],
-    top_k: int = 20,
-) -> Dict[str, Dict[str, Any]]:
-    """
-    Compute standard KL per ventile for all rollouts, stratified by correctness.
-
-    Returns a dict keyed by stratum name, each containing mean/stderr ventile
-    vectors, peak ventile index, and mean KL.
-    """
-    per_rollout: List[Dict[str, Any]] = []
-
-    for item in rollout_data:
-        kl_result = compute_standard_kl(
-            model, tokenizer,
-            question=item["question"],
-            completion=item["completion"],
-            feedback_text=item["feedback_text"],
-            student_code=item["student_code"],
-            top_k=top_k,
-        )
-        per_rollout.append({
-            "category": item["category"],
-            "ventiles": kl_result["ventiles"],
-            "mean_kl": kl_result["kl"].mean().item() if kl_result["seq_len"] > 0 else float("nan"),
-        })
-
-    results: Dict[str, Dict[str, Any]] = {}
-    for stratum in STRATA:
-        if stratum == "all":
-            subset = per_rollout
-        else:
-            subset = [r for r in per_rollout if r["category"] == stratum]
-
-        if not subset:
-            results[stratum] = {
-                "count": 0,
-                "mean_ventiles": [float("nan")] * NUM_VENTILES,
-                "stderr_ventiles": [float("nan")] * NUM_VENTILES,
-                "peak_ventile": -1,
-                "mean_kl": float("nan"),
-            }
-            continue
-
-        mean_v, stderr_v = aggregate_ventiles([r["ventiles"] for r in subset])
-        peak_ventile = max(range(NUM_VENTILES), key=lambda i: mean_v[i])
-        mean_kl = sum(r["mean_kl"] for r in subset) / len(subset)
-
-        results[stratum] = {
-            "count": len(subset),
-            "mean_ventiles": mean_v,
-            "stderr_ventiles": stderr_v,
-            "peak_ventile": peak_ventile,
-            "mean_kl": mean_kl,
-        }
-
-    return results
-
-
 def sdpo_training_step(
     model: AutoModelForCausalLM,
     teacher: EMATeacher,
@@ -218,10 +157,16 @@ def run_experiment_3(
     learning_rate: float = 1e-5,
     output_dir: str = "analysis/results",
 ) -> Dict[str, Any]:
-    """Run Experiment 3: Standard KL Convergence Over Position Across Training Steps."""
+    """Run Experiment 3: Standard KL Convergence Over Position Across Training Steps.
+
+    For each problem independently: generate rollouts, then train for
+    num_training_steps, measuring per-rollout KL at each step.  Model weights
+    are restored between problems so each problem starts from the same base.
+    Percentage-change metrics are computed per-rollout before aggregation.
+    """
 
     print("=" * 60)
-    print("Experiment 3: Standard KL Over Position")
+    print("Experiment 3: Standard KL Over Position (per-problem)")
     print("=" * 60)
     print(f"Model: {model_name}")
     print(f"Problems: {num_problems} | Rollouts: {num_rollouts}")
@@ -249,17 +194,34 @@ def run_experiment_3(
     dataset = LiveCodeBenchDataset(subset_size=num_problems)
     print(f"Loaded {len(dataset)} problems\n")
 
+    # Save initial weights — restored before each problem
+    print("Saving initial model weights...")
+    initial_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    hparams = SDPOHparams(
+        learning_rate=learning_rate,
+        top_k_distillation=top_k,
+        temperature=1.0,
+    )
+    ema_decay = 1.0 - hparams.teacher_ema_rate
+
     # -------------------------------------------------------------------
-    # Phase 1: Generate rollouts and collect feedback
+    # Per-problem training loop
     # -------------------------------------------------------------------
-    print("Generating rollouts and collecting feedback...")
-    rollout_data: List[Dict[str, Any]] = []
+    # Each rollout trajectory tracks ventiles and mean_kl across all steps.
+    all_trajectories: List[Dict[str, Any]] = []
 
     for prob_idx in range(len(dataset)):
         example = dataset[prob_idx]
         title = example.get("question_title", f"Problem {prob_idx}")
         question = example.get("question_content", example.get("question", ""))
-        print(f"  Problem {prob_idx} ({title}): generating {num_rollouts} rollouts...")
+
+        # Restore model to initial weights
+        model.load_state_dict({k: v.clone() for k, v in initial_state.items()})
+        model.eval()
+
+        print(f"Problem {prob_idx}/{len(dataset) - 1} ({title})")
+        print(f"  Generating {num_rollouts} rollouts...")
 
         original_rollouts = livecodebench_rollout(
             model, tokenizer, example,
@@ -268,6 +230,8 @@ def run_experiment_3(
             max_new_tokens=max_new_tokens,
         )
 
+        # Collect rollout data for this problem
+        problem_rollouts: List[Dict[str, Any]] = []
         for rollout in original_rollouts:
             fb = get_environment_feedback(
                 prompt=rollout.prompt, completion=rollout.completion,
@@ -275,8 +239,7 @@ def run_experiment_3(
             )
             reward = compute_reward(fb)
             category = "correct" if reward == 1.0 else "incorrect"
-
-            rollout_data.append({
+            problem_rollouts.append({
                 "question": question,
                 "completion": rollout.completion,
                 "feedback_text": fb.feedback_text,
@@ -285,115 +248,186 @@ def run_experiment_3(
                 "reward": reward,
             })
 
-    counts = {s: sum(1 for r in rollout_data if r["category"] == s) for s in ["correct", "incorrect"]}
-    print(f"\nTotal rollouts: {len(rollout_data)}")
-    print(f"  correct: {counts['correct']}")
-    print(f"  incorrect: {counts['incorrect']}\n")
+        n_correct = sum(1 for r in problem_rollouts if r["category"] == "correct")
+        n_incorrect = len(problem_rollouts) - n_correct
+        print(f"  Rollouts: {n_correct} correct, {n_incorrect} incorrect")
 
-    # -------------------------------------------------------------------
-    # Phase 2: Setup optimizer, EMA teacher, and SDPO hyperparameters
-    # -------------------------------------------------------------------
-    hparams = SDPOHparams(
-        learning_rate=learning_rate,
-        top_k_distillation=top_k,
-        temperature=1.0,
-    )
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=hparams.weight_decay,
-    )
+        # Initialize per-rollout trajectory tracking
+        trajectories = [
+            {
+                "problem_idx": prob_idx,
+                "problem_title": title,
+                "category": r["category"],
+                "ventiles_per_step": [],
+                "mean_kl_per_step": [],
+            }
+            for r in problem_rollouts
+        ]
 
-    ema_decay = 1.0 - hparams.teacher_ema_rate
-    print(f"Creating EMA teacher (decay={ema_decay})...")
-    teacher = EMATeacher(model, decay=ema_decay)
-
-    # -------------------------------------------------------------------
-    # Phase 3: Training loop with measurement at each step
-    # -------------------------------------------------------------------
-    steps_data: List[Dict[str, Any]] = []
-
-    for step in range(num_training_steps + 1):
-        model.eval()
-        print(f"Step {step}: measuring standard KL...")
-        stratified = measure_standard_kl_ventiles(
-            model, tokenizer, rollout_data, top_k=top_k,
+        # Create fresh EMA teacher and optimizer for this problem
+        teacher = EMATeacher(model, decay=ema_decay)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=hparams.weight_decay,
         )
 
-        step_record: Dict[str, Any] = {"step": step}
-        for stratum in STRATA:
-            data = stratified[stratum]
-            step_record[stratum] = {
-                "count": data["count"],
-                "mean_ventiles": data["mean_ventiles"],
-                "stderr_ventiles": data["stderr_ventiles"],
-                "peak_ventile": data["peak_ventile"],
-                "mean_kl": data["mean_kl"],
-            }
+        # Training loop for this problem
+        for step in range(num_training_steps + 1):
+            model.eval()
 
-        steps_data.append(step_record)
+            # Measure KL for each rollout
+            for r_idx, item in enumerate(problem_rollouts):
+                kl_result = compute_standard_kl(
+                    model, tokenizer,
+                    question=item["question"],
+                    completion=item["completion"],
+                    feedback_text=item["feedback_text"],
+                    student_code=item["student_code"],
+                    top_k=top_k,
+                )
+                trajectories[r_idx]["ventiles_per_step"].append(
+                    kl_result["ventiles"]
+                )
+                trajectories[r_idx]["mean_kl_per_step"].append(
+                    kl_result["kl"].mean().item()
+                    if kl_result["seq_len"] > 0
+                    else float("nan")
+                )
 
-        for stratum in STRATA:
-            data = stratified[stratum]
-            if data["count"] == 0:
-                continue
-            peak_v = data["peak_ventile"]
-            peak_pct = f"{peak_v * 5}-{(peak_v + 1) * 5}%" if peak_v >= 0 else "N/A"
-            peak_val = data["mean_ventiles"][peak_v] if peak_v >= 0 else float("nan")
-            print(f"  {stratum} (n={data['count']}): "
-                  f"mean_kl={data['mean_kl']:.4f}  "
-                  f"peak={peak_pct} ({peak_val:.4f})")
+            # Brief progress
+            mean_kls = [t["mean_kl_per_step"][-1] for t in trajectories]
+            avg_kl = sum(mean_kls) / len(mean_kls)
+            print(f"  Step {step}: avg_kl={avg_kl:.4f}", end="")
 
-        # Train (skip after last measurement)
-        if step < num_training_steps:
-            print(f"Step {step}: training...")
-            loss = sdpo_training_step(
-                model, teacher, optimizer, tokenizer, rollout_data, hparams,
-            )
-            print(f"  Loss: {loss:.6f}")
+            # Train (skip after last measurement)
+            if step < num_training_steps:
+                loss = sdpo_training_step(
+                    model, teacher, optimizer, tokenizer,
+                    problem_rollouts, hparams,
+                )
+                print(f"  loss={loss:.6f}")
+            else:
+                print()
 
+        all_trajectories.extend(trajectories)
         print()
 
     # -------------------------------------------------------------------
-    # Compute percentage-change metrics from raw ventile data
+    # Compute per-rollout percentage-change metrics
     # -------------------------------------------------------------------
-    for stratum in STRATA:
-        if steps_data[0][stratum]["count"] == 0:
-            continue
+    for traj in all_trajectories:
+        baseline_v = traj["ventiles_per_step"][0]
+        baseline_kl = traj["mean_kl_per_step"][0]
 
-        baseline = steps_data[0][stratum]["mean_ventiles"]
-        baseline_mean_kl = steps_data[0][stratum]["mean_kl"]
+        traj["cumulative_pct_per_step"] = []
+        traj["step_pct_per_step"] = []
+        traj["cumulative_pct_mean_kl_per_step"] = []
+        traj["step_pct_mean_kl_per_step"] = []
 
-        for i, rec in enumerate(steps_data):
-            s = rec[stratum]
-
-            # Cumulative % change from baseline: (KL_t - KL_0) / KL_0
-            s["cumulative_pct_ventiles"] = [
-                ((s["mean_ventiles"][d] - baseline[d]) / baseline[d] * 100.0
-                 if baseline[d] != 0 else float("nan"))
+        for t, ventiles in enumerate(traj["ventiles_per_step"]):
+            # Cumulative % change from baseline
+            cum_pct = [
+                ((ventiles[d] - baseline_v[d]) / baseline_v[d] * 100.0
+                 if baseline_v[d] != 0 else float("nan"))
                 for d in range(NUM_VENTILES)
             ]
-            s["cumulative_pct_mean_kl"] = (
-                (s["mean_kl"] - baseline_mean_kl) / baseline_mean_kl * 100.0
-                if baseline_mean_kl != 0 else float("nan")
-            )
+            traj["cumulative_pct_per_step"].append(cum_pct)
 
-            # Step-over-step % change: (KL_t - KL_{t-1}) / KL_{t-1}
-            if i == 0:
-                s["step_pct_ventiles"] = [0.0] * NUM_VENTILES
-                s["step_pct_mean_kl"] = 0.0
+            cum_pct_kl = (
+                (traj["mean_kl_per_step"][t] - baseline_kl) / baseline_kl * 100.0
+                if baseline_kl != 0 else float("nan")
+            )
+            traj["cumulative_pct_mean_kl_per_step"].append(cum_pct_kl)
+
+            # Step-over-step % change
+            if t == 0:
+                traj["step_pct_per_step"].append([0.0] * NUM_VENTILES)
+                traj["step_pct_mean_kl_per_step"].append(0.0)
             else:
-                prev = steps_data[i - 1][stratum]
-                s["step_pct_ventiles"] = [
-                    ((s["mean_ventiles"][d] - prev["mean_ventiles"][d])
-                     / prev["mean_ventiles"][d] * 100.0
-                     if prev["mean_ventiles"][d] != 0 else float("nan"))
+                prev_v = traj["ventiles_per_step"][t - 1]
+                prev_kl = traj["mean_kl_per_step"][t - 1]
+                step_pct = [
+                    ((ventiles[d] - prev_v[d]) / prev_v[d] * 100.0
+                     if prev_v[d] != 0 else float("nan"))
                     for d in range(NUM_VENTILES)
                 ]
-                s["step_pct_mean_kl"] = (
-                    (s["mean_kl"] - prev["mean_kl"]) / prev["mean_kl"] * 100.0
-                    if prev["mean_kl"] != 0 else float("nan")
+                traj["step_pct_per_step"].append(step_pct)
+                traj["step_pct_mean_kl_per_step"].append(
+                    (traj["mean_kl_per_step"][t] - prev_kl) / prev_kl * 100.0
+                    if prev_kl != 0 else float("nan")
                 )
+
+    # -------------------------------------------------------------------
+    # Aggregate across rollouts per step per stratum
+    # -------------------------------------------------------------------
+    counts = {
+        "correct": sum(1 for t in all_trajectories if t["category"] == "correct"),
+        "incorrect": sum(1 for t in all_trajectories if t["category"] == "incorrect"),
+    }
+
+    steps_data: List[Dict[str, Any]] = []
+    for step in range(num_training_steps + 1):
+        step_record: Dict[str, Any] = {"step": step}
+
+        for stratum in STRATA:
+            if stratum == "all":
+                subset = all_trajectories
+            else:
+                subset = [t for t in all_trajectories if t["category"] == stratum]
+
+            if not subset:
+                step_record[stratum] = {
+                    "count": 0,
+                    "mean_ventiles": [float("nan")] * NUM_VENTILES,
+                    "stderr_ventiles": [float("nan")] * NUM_VENTILES,
+                    "cumulative_pct_ventiles": [float("nan")] * NUM_VENTILES,
+                    "cumulative_pct_stderr": [float("nan")] * NUM_VENTILES,
+                    "step_pct_ventiles": [float("nan")] * NUM_VENTILES,
+                    "step_pct_stderr": [float("nan")] * NUM_VENTILES,
+                    "peak_ventile": -1,
+                    "mean_kl": float("nan"),
+                    "cumulative_pct_mean_kl": float("nan"),
+                    "step_pct_mean_kl": float("nan"),
+                }
+                continue
+
+            # Raw ventiles
+            raw_vs = [t["ventiles_per_step"][step] for t in subset]
+            mean_v, stderr_v = aggregate_ventiles(raw_vs)
+            peak_ventile = max(range(NUM_VENTILES), key=lambda i: mean_v[i])
+
+            # Mean KL
+            mean_kls = [t["mean_kl_per_step"][step] for t in subset]
+            mean_kl = sum(mean_kls) / len(mean_kls)
+
+            # Cumulative % change (aggregated across per-rollout values)
+            cum_pcts = [t["cumulative_pct_per_step"][step] for t in subset]
+            cum_mean, cum_stderr = aggregate_ventiles(cum_pcts)
+            cum_kls = [t["cumulative_pct_mean_kl_per_step"][step] for t in subset]
+            cum_mean_kl = sum(cum_kls) / len(cum_kls)
+
+            # Step-over-step % change
+            step_pcts = [t["step_pct_per_step"][step] for t in subset]
+            step_mean, step_stderr = aggregate_ventiles(step_pcts)
+            step_kls = [t["step_pct_mean_kl_per_step"][step] for t in subset]
+            step_mean_kl = sum(step_kls) / len(step_kls)
+
+            step_record[stratum] = {
+                "count": len(subset),
+                "mean_ventiles": mean_v,
+                "stderr_ventiles": stderr_v,
+                "cumulative_pct_ventiles": cum_mean,
+                "cumulative_pct_stderr": cum_stderr,
+                "step_pct_ventiles": step_mean,
+                "step_pct_stderr": step_stderr,
+                "peak_ventile": peak_ventile,
+                "mean_kl": mean_kl,
+                "cumulative_pct_mean_kl": cum_mean_kl,
+                "step_pct_mean_kl": step_mean_kl,
+            }
+
+        steps_data.append(step_record)
 
     # -------------------------------------------------------------------
     # Print summary
@@ -407,7 +441,7 @@ def run_experiment_3(
         # Raw KL table
         print("-" * 80)
         print("Raw KL:")
-        header = (f"{'Step':<6}{'Loss':<10}"
+        header = (f"{'Step':<6}"
                   + "".join(f"{'V' + str(d):<8}" for d in range(NUM_VENTILES))
                   + f"  {'Peak':<8}{'Mean':<8}")
         print(header)
@@ -416,8 +450,7 @@ def run_experiment_3(
             s = rec[stratum]
             peak_v = s["peak_ventile"]
             peak_label = f"V{peak_v}" if peak_v >= 0 else "N/A"
-            loss_str = f"{rec.get('loss', 0.0):<10.6f}" if "loss" in rec else f"{'':<10}"
-            line = (f"{rec['step']:<6}{loss_str}"
+            line = (f"{rec['step']:<6}"
                     + "".join(f"{v:<8.4f}" for v in s["mean_ventiles"])
                     + f"  {peak_label:<8}{s['mean_kl']:<8.4f}")
             print(line)
@@ -487,8 +520,8 @@ def run_experiment_3(
         num_cols = len(plot_strata)
         row_configs = [
             ("mean_ventiles", "Standard KL (nats/token)", "stderr_ventiles"),
-            ("cumulative_pct_ventiles", "Cumulative % change from baseline", None),
-            ("step_pct_ventiles", "Step-over-step % change", None),
+            ("cumulative_pct_ventiles", "Cumulative % change from baseline", "cumulative_pct_stderr"),
+            ("step_pct_ventiles", "Step-over-step % change", "step_pct_stderr"),
         ]
         num_rows = len(row_configs)
         fig, axes = plt.subplots(
