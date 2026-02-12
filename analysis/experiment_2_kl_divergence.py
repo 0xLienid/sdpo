@@ -24,6 +24,7 @@ from analysis.experiment_1_reward_on_regen import (
 )
 from analysis.utils import (
     bin_into_ventiles,
+    compute_full_kl_per_position,
     compute_topk_kl_per_position,
     get_completion_logits,
 )
@@ -64,9 +65,12 @@ def compute_rollout_kls(
     student_code: str,
     top_k: int = 20,
     temperature: float = 1.0,
+    full_dist: bool = False,
 ) -> Dict[str, Any]:
     """
     Compute per-position standard KL, regen KL, and delta-KL for one rollout pair.
+
+    If full_dist is True, uses the full vocabulary distribution instead of top-K.
 
     Returns dict with 'standard_kl', 'regen_kl', 'delta_kl' (all 1-D CPU tensors)
     and 'ventiles' dict with 'standard', 'regen', 'delta' (lists of 20 floats).
@@ -101,12 +105,20 @@ def compute_rollout_kls(
     )
 
     # Per-position KL
-    standard_kl = compute_topk_kl_per_position(
-        student_logits, std_teacher_logits, top_k, temperature,
-    )
-    regen_kl = compute_topk_kl_per_position(
-        student_logits, regen_teacher_logits, top_k, temperature,
-    )
+    if full_dist:
+        standard_kl = compute_full_kl_per_position(
+            student_logits, std_teacher_logits, temperature,
+        )
+        regen_kl = compute_full_kl_per_position(
+            student_logits, regen_teacher_logits, temperature,
+        )
+    else:
+        standard_kl = compute_topk_kl_per_position(
+            student_logits, std_teacher_logits, top_k, temperature,
+        )
+        regen_kl = compute_topk_kl_per_position(
+            student_logits, regen_teacher_logits, top_k, temperature,
+        )
 
     # Truncate to min length for delta
     min_len = min(len(standard_kl), len(regen_kl))
@@ -154,16 +166,18 @@ def run_experiment_2(
     temperature: float = 1.0,
     max_new_tokens: int = 4096,
     top_k: int = 20,
+    full_dist: bool = False,
     output_dir: str = "analysis/results",
 ) -> Dict[str, Any]:
     """Run Experiment 2: KL Divergence Curve Over Position."""
 
+    kl_mode = "full-dist" if full_dist else f"top-{top_k}"
     print("=" * 60)
     print("Experiment 2: KL Divergence Curve Over Position")
     print("=" * 60)
     print(f"Model: {model_name}")
     print(
-        f"Problems: {num_problems} | Rollouts: {num_rollouts} | Top-K: {top_k}")
+        f"Problems: {num_problems} | Rollouts: {num_rollouts} | KL mode: {kl_mode}")
     print("=" * 60)
     print()
 
@@ -265,6 +279,7 @@ def run_experiment_2(
                 regen_completion=regen_rollout.completion,
                 student_code=extract_python_code(rollout.completion),
                 top_k=top_k,
+                full_dist=full_dist,
             )
 
             record = {
@@ -332,6 +347,7 @@ def run_experiment_2(
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------
+    suffix = "_full_dist" if full_dist else ""
     results = {
         "config": {
             "model_name": model_name,
@@ -340,6 +356,7 @@ def run_experiment_2(
             "temperature": temperature,
             "max_new_tokens": max_new_tokens,
             "top_k": top_k,
+            "full_dist": full_dist,
             "timestamp": datetime.now().isoformat(),
         },
         "problems": problem_results,
@@ -347,7 +364,7 @@ def run_experiment_2(
     }
 
     os.makedirs(output_dir, exist_ok=True)
-    json_path = os.path.join(output_dir, "experiment_2.json")
+    json_path = os.path.join(output_dir, f"experiment_2{suffix}.json")
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Results saved to: {json_path}")
@@ -397,7 +414,7 @@ def run_experiment_2(
                 y=0, color="gray", linestyle="--", linewidth=0.5)
 
         plt.tight_layout()
-        plot_path = os.path.join(output_dir, "experiment_2.png")
+        plot_path = os.path.join(output_dir, f"experiment_2{suffix}.png")
         plt.savefig(plot_path, dpi=150)
         plt.close()
         print(f"Plot saved to: {plot_path}")
@@ -417,6 +434,8 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--full-dist", action="store_true",
+                        help="Use full vocabulary KL instead of top-K")
     parser.add_argument("--output-dir", type=str, default="analysis/results")
     args = parser.parse_args()
 
@@ -429,5 +448,6 @@ if __name__ == "__main__":
         temperature=args.temperature,
         max_new_tokens=args.max_new_tokens,
         top_k=args.top_k,
+        full_dist=args.full_dist,
         output_dir=args.output_dir,
     )

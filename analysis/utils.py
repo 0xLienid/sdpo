@@ -95,6 +95,38 @@ def compute_topk_kl_per_position(
     return kl_per_token
 
 
+def compute_full_kl_per_position(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute per-position KL(student || teacher) using the full vocabulary.
+
+    Same interface as compute_topk_kl_per_position but without top-K filtering.
+
+    Args:
+        student_logits: (student_len, vocab_size)
+        teacher_logits: (teacher_len, vocab_size)
+
+    Returns:
+        kl_per_token: (min(student_len, teacher_len),)
+    """
+    min_len = min(student_logits.shape[0], teacher_logits.shape[0])
+    if min_len == 0:
+        return torch.tensor([], device=student_logits.device)
+
+    s = student_logits[:min_len] / temperature
+    t = teacher_logits[:min_len] / temperature
+
+    s_probs = F.softmax(s, dim=-1)
+    s_log_probs = F.log_softmax(s, dim=-1)
+    t_log_probs = F.log_softmax(t, dim=-1)
+
+    kl_per_token = (s_probs * (s_log_probs - t_log_probs)).sum(dim=-1)
+    return kl_per_token
+
+
 def bin_into_ventiles(values: torch.Tensor) -> List[float]:
     """Bin a 1-D tensor into 20 equal-width bins by relative position."""
     n = len(values)
