@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from analysis.experiment_1_reward_on_regen import compute_reward
@@ -79,7 +80,8 @@ def aggregate_ventiles(
     stderrs = []
     for i in range(NUM_VENTILES):
         vals = [d[i] for d in ventile_lists]
-        var = sum((v - means[i]) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
+        var = sum((v - means[i]) ** 2 for v in vals) / \
+            (n - 1) if n > 1 else 0.0
         stderrs.append(math.sqrt(var / n) if n > 0 else 0.0)
     return means, stderrs
 
@@ -97,7 +99,8 @@ def compute_kl_fraction_and_com(
     if total <= 0:
         return [0.0] * NUM_VENTILES, float("nan")
     fraction = [v / total for v in ventiles]
-    com = sum(VENTILE_MIDPOINTS[d] * ventiles[d] for d in range(NUM_VENTILES)) / total
+    com = sum(VENTILE_MIDPOINTS[d] * ventiles[d]
+              for d in range(NUM_VENTILES)) / total
     return fraction, com
 
 
@@ -112,13 +115,17 @@ def compute_standard_kl(
     temperature: float = 1.0,
 ) -> Dict[str, Any]:
     """
-    Compute per-position standard KL for one rollout.
+    Compute per-position standard KL and teacher disagreement for one rollout.
 
     Standard KL = KL(student || teacher) where both evaluate the same completion,
     student is conditioned on problem only, teacher on problem + feedback.
 
-    Returns dict with 'kl' (1-D CPU tensor), 'ventiles' (list of 20 floats),
-    'fraction' (list of 20 floats), 'com' (float), and 'seq_len'.
+    Teacher disagreement = fraction of tokens where the teacher assigns lower
+    probability to the actual next token than the student does, i.e.
+    log P_teacher(token) < log P_student(token).
+
+    Returns dict with 'kl', 'ventiles', 'fraction', 'com', 'seq_len',
+    and 'disagreement_ventiles' (list of 20 floats, each in [0, 1]).
     """
     student_msgs = [{"role": "user", "content": question}]
 
@@ -143,12 +150,57 @@ def compute_standard_kl(
     ventiles = bin_into_ventiles(kl.detach().cpu())
     fraction, com = compute_kl_fraction_and_com(ventiles)
 
+    # --- Teacher disagreement per position ---
+    # Get completion token IDs from the student-side tokenization.
+    full_messages = student_msgs + [
+        {"role": "assistant", "content": completion},
+    ]
+    full_text = tokenizer.apply_chat_template(
+        full_messages, tokenize=False, add_generation_prompt=False,
+    )
+    prompt_text = tokenizer.apply_chat_template(
+        student_msgs, tokenize=False, add_generation_prompt=True,
+    )
+    full_ids = tokenizer(
+        full_text, truncation=True, max_length=10240, padding=False,
+    ).input_ids
+    prompt_len_s = len(tokenizer(
+        prompt_text, truncation=True, max_length=10240, padding=False,
+    ).input_ids)
+    completion_token_ids = torch.tensor(
+        full_ids[prompt_len_s:], device=student_logits.device,
+    )
+
+    min_len = min(
+        student_logits.shape[0],
+        teacher_logits.shape[0],
+        len(completion_token_ids),
+    )
+
+    if min_len > 0:
+        s_log_probs = F.log_softmax(student_logits[:min_len], dim=-1)
+        t_log_probs = F.log_softmax(teacher_logits[:min_len], dim=-1)
+        token_ids = completion_token_ids[:min_len]
+        idx = torch.arange(min_len, device=s_log_probs.device)
+
+        s_token_logp = s_log_probs[idx, token_ids]
+        t_token_logp = t_log_probs[idx, token_ids]
+
+        # Disagreement: teacher assigns lower prob than student.
+        print(t_token_logp - s_token_logp)
+        raise ValueError("Stop here")
+        disagreement = (t_token_logp < s_token_logp).float()
+        disagreement_ventiles = bin_into_ventiles(disagreement.detach().cpu())
+    else:
+        disagreement_ventiles = [float("nan")] * NUM_VENTILES
+
     return {
         "kl": kl.detach().cpu(),
         "ventiles": ventiles,
         "fraction": fraction,
         "com": com,
         "seq_len": len(kl),
+        "disagreement_ventiles": disagreement_ventiles,
     }
 
 
@@ -222,6 +274,7 @@ def measure_rollouts(
                 if kl_result["seq_len"] > 0
                 else float("nan")
             ),
+            "disagreement_ventiles": kl_result["disagreement_ventiles"],
         })
     return results
 
@@ -242,6 +295,8 @@ def aggregate_measurements(
                 "count": 0,
                 "kl_fraction_ventiles": [float("nan")] * NUM_VENTILES,
                 "kl_fraction_stderr": [float("nan")] * NUM_VENTILES,
+                "disagreement_ventiles": [float("nan")] * NUM_VENTILES,
+                "disagreement_stderr": [float("nan")] * NUM_VENTILES,
                 "center_of_mass": float("nan"),
                 "center_of_mass_stderr": float("nan"),
                 "mean_kl": float("nan"),
@@ -251,6 +306,9 @@ def aggregate_measurements(
 
         frac_mean, frac_stderr = aggregate_ventiles(
             [r["fraction"] for r in subset]
+        )
+        disagree_mean, disagree_stderr = aggregate_ventiles(
+            [r["disagreement_ventiles"] for r in subset]
         )
         com_mean, com_stderr = aggregate_values(
             [r["com"] for r in subset]
@@ -262,6 +320,8 @@ def aggregate_measurements(
             "count": len(subset),
             "kl_fraction_ventiles": frac_mean,
             "kl_fraction_stderr": frac_stderr,
+            "disagreement_ventiles": disagree_mean,
+            "disagreement_stderr": disagree_stderr,
             "center_of_mass": com_mean,
             "center_of_mass_stderr": com_stderr,
             "mean_kl": mean_kl,
@@ -302,7 +362,8 @@ def run_experiment_3(
     print("=" * 60)
     print(f"Model: {model_name}")
     print(f"Problems: {num_problems} | Rollouts/gen: {num_rollouts}")
-    print(f"Generations: {num_outer_steps} | Inner steps/gen: {num_inner_steps}")
+    print(
+        f"Generations: {num_outer_steps} | Inner steps/gen: {num_inner_steps}")
     print(f"Total gradient steps per problem: {total_steps}")
     print(f"LR: {learning_rate} | Top-K: {top_k}")
     print("=" * 60)
@@ -318,7 +379,8 @@ def run_experiment_3(
     model = model.cuda()
     model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -348,7 +410,8 @@ def run_experiment_3(
         [] for _ in range(num_measurement_points)
     ]
     # Track which measurement indices are regeneration points.
-    regeneration_indices = [g * num_inner_steps for g in range(num_outer_steps)]
+    regeneration_indices = [
+        g * num_inner_steps for g in range(num_outer_steps)]
 
     for prob_idx in range(len(dataset)):
         example = dataset[prob_idx]
@@ -412,11 +475,17 @@ def run_experiment_3(
                 )
                 all_snapshots[step_idx].extend(measurements)
 
-                avg_com = sum(m["com"] for m in measurements) / len(measurements)
-                avg_kl = sum(m["mean_kl"] for m in measurements) / len(measurements)
+                avg_com = sum(m["com"]
+                              for m in measurements) / len(measurements)
+                avg_kl = sum(m["mean_kl"]
+                             for m in measurements) / len(measurements)
+                all_dis = [m["disagreement_ventiles"] for m in measurements]
+                avg_dis = sum(
+                    sum(d) / len(d) for d in all_dis
+                ) / len(all_dis)
                 print(
                     f"    Step {step_idx}: com={avg_com:.3f} "
-                    f"avg_kl={avg_kl:.4f}",
+                    f"avg_kl={avg_kl:.4f} dis={avg_dis:.1%}",
                     end="",
                 )
 
@@ -460,8 +529,10 @@ def run_experiment_3(
         n_correct_final = sum(
             1 for r in final_rollout_data if r["category"] == "correct"
         )
-        avg_com = sum(m["com"] for m in final_measurements) / len(final_measurements)
-        avg_kl = sum(m["mean_kl"] for m in final_measurements) / len(final_measurements)
+        avg_com = sum(m["com"]
+                      for m in final_measurements) / len(final_measurements)
+        avg_kl = sum(m["mean_kl"]
+                     for m in final_measurements) / len(final_measurements)
         print(
             f"    Step {step_idx} (final): {n_correct_final}/{num_rollouts} correct, "
             f"com={avg_com:.3f} avg_kl={avg_kl:.4f}"
@@ -501,10 +572,10 @@ def run_experiment_3(
         print("-" * 70)
 
         header = (
-            f"{'Step':<6}{'Gen':<5}{'Regen':<7}"
-            f"{'COM':<8}{'KL':<8}{'Reward':<8}"
-            f"{'Frac V0-V4':<12}{'Frac V5-V9':<12}"
-            f"{'Frac V10-14':<12}{'Frac V15-19':<12}"
+            f"{'Step':<6}{'Gen':<5}{'R':<3}"
+            f"{'COM':<8}{'KL':<8}"
+            f"{'Frac Q1':<9}{'Frac Q4':<9}"
+            f"{'Dis Q1':<9}{'Dis Q2':<9}{'Dis Q3':<9}{'Dis Q4':<9}"
         )
         print(header)
         print("-" * len(header))
@@ -514,17 +585,19 @@ def run_experiment_3(
             if s["count"] == 0:
                 continue
             frac = s["kl_fraction_ventiles"]
-            # Aggregate into quartile groups for readability
-            q1 = sum(frac[0:5])
-            q2 = sum(frac[5:10])
-            q3 = sum(frac[10:15])
-            q4 = sum(frac[15:20])
+            dis = s["disagreement_ventiles"]
+            fq1 = sum(frac[0:5]) / 5
+            fq4 = sum(frac[15:20]) / 5
+            dq1 = sum(dis[0:5]) / 5
+            dq2 = sum(dis[5:10]) / 5
+            dq3 = sum(dis[10:15]) / 5
+            dq4 = sum(dis[15:20]) / 5
             regen = "*" if rec["is_regeneration"] else ""
             line = (
-                f"{rec['step']:<6}{rec['generation']:<5}{regen:<7}"
+                f"{rec['step']:<6}{rec['generation']:<5}{regen:<3}"
                 f"{s['center_of_mass']:<8.3f}{s['mean_kl']:<8.4f}"
-                f"{s['mean_reward']:<8.3f}"
-                f"{q1:<12.3f}{q2:<12.3f}{q3:<12.3f}{q4:<12.3f}"
+                f"{fq1:<9.3f}{fq4:<9.3f}"
+                f"{dq1:<9.1%}{dq2:<9.1%}{dq3:<9.1%}{dq4:<9.1%}"
             )
             print(line)
 
@@ -569,7 +642,7 @@ def run_experiment_3(
         ]
         num_cols = len(plot_strata)
         fig, axes = plt.subplots(
-            2, num_cols, figsize=(10 * num_cols, 12), squeeze=False,
+            3, num_cols, figsize=(10 * num_cols, 18), squeeze=False,
         )
         steps_x = [rec["step"] for rec in measurements_data]
         cmap = plt.cm.viridis
@@ -640,6 +713,45 @@ def run_experiment_3(
             ax.set_title(f"KL center of mass — {stratum} (n={n})")
             ax.set_ylim(0, 1)
             ax.axhline(y=0.5, color="gray", linestyle=":", alpha=0.5)
+
+            # --- Row 2: Teacher disagreement per ventile ---
+            ax = axes[2][col]
+            for d in range(NUM_VENTILES):
+                values = [
+                    rec[stratum]["disagreement_ventiles"][d]
+                    for rec in measurements_data
+                ]
+                stderrs = [
+                    rec[stratum]["disagreement_stderr"][d]
+                    for rec in measurements_data
+                ]
+                color = cmap(d / (NUM_VENTILES - 1))
+                label = f"{d * 5}-{(d + 1) * 5}%"
+                ax.plot(
+                    steps_x, values, color=color, label=label, linewidth=1.5,
+                )
+                ax.fill_between(
+                    steps_x,
+                    [v - se for v, se in zip(values, stderrs)],
+                    [v + se for v, se in zip(values, stderrs)],
+                    color=color, alpha=0.1,
+                )
+
+            for ri in regeneration_indices:
+                ax.axvline(x=ri, color="red", linestyle="--", alpha=0.4)
+            ax.axvline(x=total_steps, color="red", linestyle="--", alpha=0.4)
+
+            ax.set_xlabel("Gradient Step")
+            ax.set_ylabel("Disagreement Rate")
+            ax.set_title(
+                f"Teacher disagreement rate — {stratum} (n={n})"
+            )
+            ax.set_ylim(0, 1)
+            if col == num_cols - 1:
+                ax.legend(
+                    title="Position Ventile", bbox_to_anchor=(1.02, 1),
+                    loc="upper left", fontsize="x-small", ncol=2,
+                )
 
         plt.tight_layout()
         plot_path = os.path.join(output_dir, "experiment_3.png")
