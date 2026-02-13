@@ -187,9 +187,7 @@ def compute_standard_kl(
         t_token_logp = t_log_probs[idx, token_ids]
 
         # Disagreement: teacher assigns lower prob than student.
-        print(t_token_logp - s_token_logp)
-        raise ValueError("Stop here")
-        disagreement = (t_token_logp < s_token_logp).float()
+        disagreement = (t_token_logp - s_token_logp < -0.025).float()
         disagreement_ventiles = bin_into_ventiles(disagreement.detach().cpu())
     else:
         disagreement_ventiles = [float("nan")] * NUM_VENTILES

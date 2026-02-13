@@ -40,7 +40,7 @@ Following the SDPO paper and the codebase implementation:
 
 ### Training Hyperparameters
 
-Use codebase defaults for all training experiments (Experiments 3 and 4):
+Use codebase defaults for all training experiments (Experiments 3 and 5):
 
 - **Optimizer:** AdamW
 - **Learning rate:** 1e-6
@@ -51,7 +51,7 @@ Use codebase defaults for all training experiments (Experiments 3 and 4):
 
 ### Training Scope
 
-For Experiments 3 and 4, training is done **on the same problems being evaluated** — train on the problem, evaluate on the problem. The goal is to observe the direct impact of training on behavior, not generalization.
+For Experiments 3 and 5, training is done **on the same problems being evaluated** — train on the problem, evaluate on the problem. The goal is to observe the direct impact of training on behavior, not generalization.
 
 ### Training Approaches
 
@@ -119,7 +119,28 @@ For Experiments 3 and 4, training is done **on the same problems being evaluated
 
 **Expected result:** Earlier token positions (lower decile lines) reduce their delta-KL faster than later tokens, confirming that the model learns from clean early signal but struggles with corrupted late signal.
 
-### 4. Supervision Window Ablation
+### 4. Structural Entropy Analysis
+
+**Goal:** Test whether the front-loaded KL profile is explained by structural properties of code generation (early tokens have higher entropy) rather than prefix corruption.
+
+**Motivation:** Experiment 3 showed that teacher disagreement rate is roughly uniform across the sequence (~13-17%), while KL magnitude is heavily front-loaded (~3x higher in the first quartile vs the last). This raises the question: is the KL front-loading caused by prefix corruption, or simply because early tokens in code completions have inherently higher entropy (more viable algorithmic choices), making distributional differences naturally larger?
+
+**Procedure:**
+
+- For 15 LCB problems, generate 8 rollouts with the model, execute against public test cases
+- At each token position, compute:
+  - **Student entropy:** H(student) = -sum(p * log p) over the full vocabulary
+  - **Teacher entropy:** H(teacher) = -sum(p * log p) over the full vocabulary
+  - **KL(student || teacher):** top-20 filtered, matching SDPO implementation
+  - **KL / entropy ratio:** KL at position t divided by student entropy at position t
+  - **Disagreement rate:** fraction of tokens where log P_teacher(token) < log P_student(token)
+  - **Disagreement magnitude:** mean |log P_teacher - log P_student| at disagreeing positions
+- Bin all metrics into ventiles (20 equal-width bins by relative position)
+- Compute Pearson correlation between per-ventile student entropy and per-ventile KL
+
+**Expected result:** If student entropy tracks the KL profile closely (r ≈ 1.0) and the KL/entropy ratio is roughly constant across ventiles, then the front-loading is structural — a property of code generation, not prefix corruption. If the KL/entropy ratio increases at later positions (KL drops faster than entropy), that would suggest an additional factor like prefix corruption on top of the structural baseline.
+
+### 5. Supervision Window Ablation
 
 **Goal:** Demonstrate that late-sequence distillation signal is actively harmful, not merely uninformative.
 
@@ -135,7 +156,7 @@ For Experiments 3 and 4, training is done **on the same problems being evaluated
 
 **Expected result:** Full training and first-50% training should perform similarly, while last-50% should perform notably worse (lower average reward delta).
 
-### 5. Top-k Token Analysis
+### 6. Top-k Token Analysis
 
 **Goal:** Assess whether top-k filtering mitigates prefix corruption, and look for qualitative signs of teacher confusion in later positions.
 
