@@ -6,7 +6,8 @@ Training loop:
 2. For each epoch:
    a. For each problem: greedy-decode corrected sequences for all rollouts,
       normalize rewards across rollouts (GRPO), compute policy gradient loss
-   b. Periodically evaluate with greedy decoding
+   b. Add KL(corrected || original) penalty to keep corrections bounded
+   c. Periodically evaluate with greedy decoding
 3. Save results and correction head state dict
 
 GRPO group = all rollouts for one problem. Different rollouts have different
@@ -20,7 +21,6 @@ but lm_head's weights are never updated.
 
 import argparse
 import json
-import math
 import os
 import random
 from dataclasses import dataclass
@@ -212,13 +212,14 @@ def greedy_decode_corrected(
     lm_head: torch.nn.Module,
     rollout: PrecomputedRollout,
     tokenizer: AutoTokenizer,
-) -> Tuple[torch.Tensor, List[int], torch.Tensor]:
+) -> Tuple[torch.Tensor, List[int], torch.Tensor, torch.Tensor]:
     """Greedy decode from corrected top-k logits.
 
     Returns:
-        seq_log_prob: scalar tensor (differentiable) — log P of the greedy seq
+        mean_log_prob: scalar (differentiable) — per-token mean log P of greedy seq
         token_ids: list of greedy token IDs (for decoding / execution)
-        correction_norm: scalar tensor (detached) — mean L2 norm of corrections
+        correction_norm: scalar (detached) — mean L2 norm of corrections
+        kl_penalty: scalar (differentiable) — mean KL(corrected || original) per position
     """
     hidden = rollout.hidden_states   # (L, D)
     topk_idx = rollout.topk_indices  # (L, K)
@@ -228,9 +229,20 @@ def greedy_decode_corrected(
     corrections = correction_head(hidden.unsqueeze(0)).squeeze(0)  # (L, D)
     corrected_hidden = hidden + corrections
 
-    corrected_logits = lm_head(corrected_hidden)                   # (L, V)
-    topk_logits = corrected_logits.gather(1, topk_idx).float()     # (L, K) fp32
+    # Original (uncorrected) teacher top-k logits — treated as fixed target
+    with torch.no_grad():
+        original_logits = lm_head(hidden)
+        original_topk = original_logits.gather(1, topk_idx).float()
+        original_log_probs = F.log_softmax(original_topk, dim=-1)
+
+    # Corrected top-k logits
+    corrected_logits = lm_head(corrected_hidden)
+    topk_logits = corrected_logits.gather(1, topk_idx).float()     # (L, K)
     topk_log_probs = F.log_softmax(topk_logits, dim=-1)            # (L, K)
+
+    # KL(corrected || original) per position
+    corrected_probs = topk_log_probs.exp()
+    kl_per_pos = (corrected_probs * (topk_log_probs - original_log_probs)).sum(dim=-1)
 
     # Greedy: pick argmax within top-k
     greedy_k = topk_logits.argmax(dim=-1)                          # (L,)
@@ -244,18 +256,20 @@ def greedy_decode_corrected(
         if eos_mask.any():
             active_len = eos_mask.nonzero(as_tuple=True)[0][0].item()
 
-    # Log prob of greedy sequence (differentiable)
+    # Per-token mean log prob (length-normalized, differentiable)
     if active_len > 0:
-        seq_log_prob = topk_log_probs[:active_len][
+        mean_log_prob = topk_log_probs[:active_len][
             torch.arange(active_len, device=device), greedy_k[:active_len]
-        ].sum()
+        ].mean()
+        kl = kl_per_pos[:active_len].mean()
     else:
-        seq_log_prob = torch.tensor(0.0, device=device, requires_grad=True)
+        mean_log_prob = torch.tensor(0.0, device=device, requires_grad=True)
+        kl = torch.tensor(0.0, device=device, requires_grad=True)
 
     token_ids = greedy_vocab[:active_len].tolist()
     corr_norm = corrections.detach().norm(dim=-1).mean()
 
-    return seq_log_prob, token_ids, corr_norm
+    return mean_log_prob, token_ids, corr_norm, kl
 
 
 # ---------------------------------------------------------------------------
@@ -267,29 +281,32 @@ def grpo_loss_for_problem(
     lm_head: torch.nn.Module,
     rollouts: List[PrecomputedRollout],
     tokenizer: AutoTokenizer,
+    kl_coeff: float = 0.1,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """Compute GRPO loss across all rollouts of one problem.
 
     1. For each rollout: greedy-decode the corrected sequence, execute, get reward
     2. Normalize advantages across rollouts (the GRPO "group")
-    3. Loss = -mean(advantage * seq_log_prob)
+    3. Loss = -mean(advantage * mean_log_prob) + kl_coeff * mean_kl
 
-    Returns None for loss if the problem has < 2 rollouts or uniform rewards.
+    Returns None for loss only if < 2 rollouts.
     """
     if len(rollouts) < 2:
         return None, {}
 
     device = rollouts[0].hidden_states.device
-    seq_log_probs: List[torch.Tensor] = []
+    mean_log_probs: List[torch.Tensor] = []
     rewards: List[float] = []
     norms: List[float] = []
+    kl_penalties: List[torch.Tensor] = []
 
     for rollout in rollouts:
-        seq_lp, token_ids, corr_norm = greedy_decode_corrected(
+        mean_lp, token_ids, corr_norm, kl = greedy_decode_corrected(
             correction_head, lm_head, rollout, tokenizer,
         )
-        seq_log_probs.append(seq_lp)
+        mean_log_probs.append(mean_lp)
         norms.append(corr_norm.item())
+        kl_penalties.append(kl)
 
         text = tokenizer.decode(token_ids, skip_special_tokens=True)
         try:
@@ -303,30 +320,31 @@ def grpo_loss_for_problem(
         rewards.append(r)
 
     rewards_t = torch.tensor(rewards, device=device, dtype=torch.float32)
-    seq_lp_t = torch.stack(seq_log_probs)  # (N,)
+    lp_t = torch.stack(mean_log_probs)   # (N,)
+    kl_t = torch.stack(kl_penalties)     # (N,)
+    mean_kl = kl_t.mean()
 
     # GRPO: group-normalised advantages across rollouts
     reward_std = rewards_t.std()
-    if reward_std < 1e-8:
-        # All rewards identical — no gradient signal for this problem
-        return None, {
-            "loss": 0.0,
-            "mean_reward": rewards_t.mean().item(),
-            "max_reward": rewards_t.max().item(),
-            "correction_norm": sum(norms) / len(norms),
-            "reward_std": 0.0,
-            "n_rollouts": len(rollouts),
-        }
+    has_policy_signal = reward_std > 1e-8
 
-    advantages = (rewards_t - rewards_t.mean()) / (reward_std + 1e-8)
-    loss = -(advantages.detach() * seq_lp_t).mean()
+    if has_policy_signal:
+        advantages = (rewards_t - rewards_t.mean()) / (reward_std + 1e-8)
+        policy_loss = -(advantages.detach() * lp_t).mean()
+    else:
+        policy_loss = torch.tensor(0.0, device=device)
+
+    loss = policy_loss + kl_coeff * mean_kl
 
     metrics = {
         "loss": loss.item(),
+        "policy_loss": policy_loss.item(),
+        "kl_penalty": mean_kl.item(),
         "mean_reward": rewards_t.mean().item(),
         "max_reward": rewards_t.max().item(),
         "correction_norm": sum(norms) / len(norms),
         "reward_std": reward_std.item(),
+        "has_policy_signal": has_policy_signal,
         "n_rollouts": len(rollouts),
     }
     return loss, metrics
@@ -435,6 +453,7 @@ def run_experiment_8(
     max_grad_norm: float = 1.0,
     num_epochs: int = 20,
     eval_every: int = 5,
+    kl_coeff: float = 0.1,
     # Output
     output_dir: str = "analysis/results",
 ) -> Dict[str, Any]:
@@ -444,9 +463,11 @@ def run_experiment_8(
     print("=" * 60)
     print(f"Model: {model_name}")
     print(f"Problems: {num_problems} | Rollouts/problem: {num_rollouts}")
-    print(f"Head: {head_num_layers} layers, {head_num_heads} heads")
+    print(f"Head: {head_num_layers} layers, {head_num_heads} heads, "
+          f"init_scale={head_init_scale}")
     print(f"GRPO: cross-rollout (group = all rollouts per problem)")
-    print(f"Training: lr={learning_rate}, epochs={num_epochs}")
+    print(f"Training: lr={learning_rate}, epochs={num_epochs}, "
+          f"kl_coeff={kl_coeff}")
     print("=" * 60)
     print()
 
@@ -481,8 +502,6 @@ def run_experiment_8(
     ).to(device=model.device, dtype=torch.bfloat16)
 
     print(f"Correction head: {head.num_parameters():,} parameters")
-    print(f"Initial gate value: softplus({head.gate_logit.item():.2f}) "
-          f"= {F.softplus(head.gate_logit).item():.4f}")
     print()
 
     # ------------------------------------------------------------------
@@ -505,7 +524,7 @@ def run_experiment_8(
     print(f"\nPre-computed {n_total} rollouts "
           f"(correct={n_correct}, incorrect={n_incorrect})")
 
-    # Report which problems have reward variance (will produce gradient)
+    # Report which problems have reward variance (will produce policy gradient)
     for prob_idx, rollouts in by_problem.items():
         rewards = [r.reward for r in rollouts]
         has_var = len(set(rewards)) > 1
@@ -556,7 +575,8 @@ def run_experiment_8(
         random.shuffle(problem_indices)
 
         epoch_losses, epoch_rewards, epoch_norms = [], [], []
-        problems_with_grad = 0
+        epoch_policy_losses, epoch_kls = [], []
+        problems_with_policy = 0
 
         for prob_idx in problem_indices:
             rollouts = by_problem[prob_idx]
@@ -567,17 +587,21 @@ def run_experiment_8(
             optimizer.zero_grad()
 
             loss, metrics = grpo_loss_for_problem(
-                head, lm_head, rollouts, tokenizer,
+                head, lm_head, rollouts, tokenizer, kl_coeff=kl_coeff,
             )
 
             if loss is not None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(head.parameters(), max_grad_norm)
                 optimizer.step()
-                problems_with_grad += 1
+
+            if metrics.get("has_policy_signal", False):
+                problems_with_policy += 1
 
             global_step += 1
             epoch_losses.append(metrics.get("loss", 0.0))
+            epoch_policy_losses.append(metrics.get("policy_loss", 0.0))
+            epoch_kls.append(metrics.get("kl_penalty", 0.0))
             epoch_rewards.append(metrics.get("mean_reward", 0.0))
             epoch_norms.append(metrics.get("correction_norm", 0.0))
 
@@ -587,14 +611,15 @@ def run_experiment_8(
             })
 
         # Epoch summary
-        gate_val = F.softplus(head.gate_logit).item()
-        if epoch_losses:
+        n_probs = len(epoch_losses)
+        if n_probs > 0:
             print(
-                f"  loss={sum(epoch_losses)/len(epoch_losses):.4f}  "
-                f"reward={sum(epoch_rewards)/len(epoch_rewards):.3f}  "
-                f"norm={sum(epoch_norms)/len(epoch_norms):.4f}  "
-                f"gate={gate_val:.4f}  "
-                f"grad_problems={problems_with_grad}/{len(problem_indices)}"
+                f"  loss={sum(epoch_losses)/n_probs:.4f}  "
+                f"policy={sum(epoch_policy_losses)/n_probs:.4f}  "
+                f"kl={sum(epoch_kls)/n_probs:.4f}  "
+                f"reward={sum(epoch_rewards)/n_probs:.3f}  "
+                f"norm={sum(epoch_norms)/n_probs:.4f}  "
+                f"policy_problems={problems_with_policy}/{len(problem_indices)}"
             )
 
         # Periodic evaluation
@@ -667,6 +692,7 @@ def run_experiment_8(
             "learning_rate": learning_rate,
             "max_grad_norm": max_grad_norm,
             "num_epochs": num_epochs,
+            "kl_coeff": kl_coeff,
             "hidden_dim": hidden_dim,
             "timestamp": datetime.now().isoformat(),
         },
@@ -704,6 +730,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-epochs", type=int, default=20)
     parser.add_argument("--eval-every", type=int, default=5)
+    parser.add_argument("--kl-coeff", type=float, default=0.1)
     # Output
     parser.add_argument("--output-dir", type=str, default="analysis/results")
     args = parser.parse_args()
@@ -723,5 +750,6 @@ if __name__ == "__main__":
         max_grad_norm=args.max_grad_norm,
         num_epochs=args.num_epochs,
         eval_every=args.eval_every,
+        kl_coeff=args.kl_coeff,
         output_dir=args.output_dir,
     )

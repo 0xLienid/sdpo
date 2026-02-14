@@ -12,7 +12,6 @@ the original teacher's behavior.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class CorrectionHead(nn.Module):
@@ -49,11 +48,6 @@ class CorrectionHead(nn.Module):
         nn.init.normal_(self.output_proj.weight, std=init_scale)
         nn.init.zeros_(self.output_proj.bias)
 
-        # Learnable gate starting near zero — ensures corrections are truly
-        # small at init even though the encoder amplifies its input.
-        # softplus(-4) ≈ 0.018
-        self.gate_logit = nn.Parameter(torch.tensor(-4.0))
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -63,7 +57,7 @@ class CorrectionHead(nn.Module):
         """
         x = self.input_norm(hidden_states)
         x = self.encoder(x)
-        return self.output_proj(x) * F.softplus(self.gate_logit)
+        return self.output_proj(x)
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
