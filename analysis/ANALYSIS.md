@@ -40,7 +40,7 @@ Following the SDPO paper and the codebase implementation:
 
 ### Training Hyperparameters
 
-Use codebase defaults for all training experiments (Experiments 3 and 5):
+Use codebase defaults for all training experiments (Experiments 3 and 6):
 
 - **Optimizer:** AdamW
 - **Learning rate:** 1e-6
@@ -51,7 +51,7 @@ Use codebase defaults for all training experiments (Experiments 3 and 5):
 
 ### Training Scope
 
-For Experiments 3 and 5, training is done **on the same problems being evaluated** — train on the problem, evaluate on the problem. The goal is to observe the direct impact of training on behavior, not generalization.
+For Experiments 3 and 6, training is done **on the same problems being evaluated** — train on the problem, evaluate on the problem. The goal is to observe the direct impact of training on behavior, not generalization.
 
 ### Training Approaches
 
@@ -140,7 +140,29 @@ For Experiments 3 and 5, training is done **on the same problems being evaluated
 
 **Expected result:** If student entropy tracks the KL profile closely (r ≈ 1.0) and the KL/entropy ratio is roughly constant across ventiles, then the front-loading is structural — a property of code generation, not prefix corruption. If the KL/entropy ratio increases at later positions (KL drops faster than entropy), that would suggest an additional factor like prefix corruption on top of the structural baseline.
 
-### 5. Supervision Window Ablation
+### 5. Constrained Regeneration
+
+**Goal:** Test whether constraining the teacher to generate from the student's top-k token set at each position produces a flatter (less front-loaded) KL profile, by giving the teacher a self-consistent prefix while staying in the student's probability mass.
+
+**Motivation:** Standard SDPO's teacher evaluates the student's exact rollout, so its corrections at later positions are made in context of tokens it already wanted to change. Free regeneration (Experiment 1) produces better solutions but diverges too far from the student's distribution for the top-k KL signal to be useful. Constrained regeneration is a middle ground: the teacher generates autoregressively from its own (self-consistent) prefix, but at each position can only select from the student's top-k tokens at that ordinal position.
+
+**Procedure:**
+
+- For 10 LCB problems, generate 8 rollouts with the model, execute against public test cases
+- For each rollout:
+  - Compute student logits at each position and extract the top-k token indices
+  - Build teacher context (problem + feedback + student attempt)
+  - Generate a constrained completion autoregressively: at each step, mask teacher logits to the student's top-k tokens at that ordinal position, then greedily select the most likely allowed token
+  - Compute **standard KL** (student vs standard teacher on the student's completion)
+  - Compute **constrained KL** (student vs constrained teacher on the constrained completion)
+  - Execute the constrained completion against the test cases for reward
+  - Measure **token overlap** per ventile (fraction of positions where constrained token matches student token)
+- Bin all metrics into ventiles, aggregate by stratum (all/incorrect/correct)
+- Compare KL fraction profiles and center of mass between standard and constrained conditions
+
+**Expected result:** The constrained KL profile should be flatter than the standard KL profile (center of mass closer to 0.5), because the constrained teacher generates from a self-consistent prefix rather than evaluating against the student's potentially flawed one. Token overlap should decrease across ventiles as the teacher increasingly diverges from the student's choices at later positions.
+
+### 6. Supervision Window Ablation
 
 **Goal:** Demonstrate that late-sequence distillation signal is actively harmful, not merely uninformative.
 
@@ -156,7 +178,7 @@ For Experiments 3 and 5, training is done **on the same problems being evaluated
 
 **Expected result:** Full training and first-50% training should perform similarly, while last-50% should perform notably worse (lower average reward delta).
 
-### 6. Top-k Token Analysis
+### 7. Top-k Token Analysis
 
 **Goal:** Assess whether top-k filtering mitigates prefix corruption, and look for qualitative signs of teacher confusion in later positions.
 
@@ -169,3 +191,31 @@ For Experiments 3 and 5, training is done **on the same problems being evaluated
   - Relative to the student's distribution over the same late positions (50-100%)
 
 **Expected result:** Top-k filtering reduces absolute KL magnitude but doesn't flatten the degradation curve. In later deciles, the teacher increasingly places mass on backtracking/correction tokens, suggesting it's trying to "fix" the student's prefix rather than providing useful next-token signal.
+
+### 8. Non-Causal Correction Head
+
+**Goal:** Train a bidirectional correction head that produces improved distillation targets by observing the full student rollout, then use these corrected targets for standard SDPO distillation.
+
+**Motivation:** The prefix corruption problem arises because the causal teacher must evaluate each position without knowledge of what it would change at earlier positions. A non-causal (bidirectional) head that sees the entire student rollout can produce globally coherent corrections — it knows what needs to change everywhere before deciding what to change anywhere.
+
+**Architecture:**
+
+- A small bidirectional transformer head (2-4 layers) attached to the base model's final hidden states
+- Input: the base model's hidden states for `(teacher context, student rollout)` — frozen, no gradient flows into the base model
+- Output: per-position correction vectors (residual), initialized near zero via small weight init
+- Corrected logits: `lm_head(hidden_states + correction_vectors)`, masked to the student's top-20 tokens
+
+**Training (RL):**
+
+1. Base model produces hidden states for `(teacher context, student rollout)` — all base model parameters frozen
+2. Correction head outputs per-position correction vectors (starting near zero)
+3. Corrected logits computed: `lm_head(hidden_states + correction)`, masked to student's top-20 tokens
+4. Greedy decode the corrected sequence from the masked logits
+5. Execute the corrected sequence against test cases, compute reward
+6. Policy gradient (REINFORCE) updates only the correction head parameters
+
+**Distillation:**
+
+Once the correction head is trained, its corrected top-20 logits serve as distillation targets. The student trains via `KL(student || corrected_teacher)` using the standard SDPO loss, but with the correction head's output replacing the standard causal teacher logits.
+
+**Expected result:** The correction head should learn to produce globally coherent corrections that improve reward relative to both the student's original rollout and the standard causal teacher's corrections. When used as distillation targets, training should show a flatter KL convergence profile (Experiment 3 style) and improved reward compared to standard SDPO.
