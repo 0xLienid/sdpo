@@ -4,9 +4,14 @@ GRPO training for the non-causal correction head (Experiment 8).
 Training loop:
 1. Pre-compute base model hidden states and student top-k for all rollouts
 2. For each epoch:
-   a. For each problem: accumulate GRPO loss over its rollouts, step optimizer
+   a. For each problem: greedy-decode corrected sequences for all rollouts,
+      normalize rewards across rollouts (GRPO), compute policy gradient loss
    b. Periodically evaluate with greedy decoding
 3. Save results and correction head state dict
+
+GRPO group = all rollouts for one problem. Different rollouts have different
+hidden states, so the correction head produces different corrections for each.
+The cross-rollout reward variation provides the advantage signal.
 
 The correction head is the only trainable component. The base model and lm_head
 are completely frozen — gradients flow *through* lm_head to the correction head
@@ -117,7 +122,7 @@ def precompute_rollouts(
 ) -> Dict[int, List[PrecomputedRollout]]:
     """Generate rollouts and pre-compute hidden states + top-k indices.
 
-    Returns a dict mapping problem_idx → list of PrecomputedRollout.
+    Returns a dict mapping problem_idx -> list of PrecomputedRollout.
     """
     by_problem: Dict[int, List[PrecomputedRollout]] = {}
 
@@ -145,7 +150,7 @@ def precompute_rollouts(
             category = "correct" if reward == 1.0 else "incorrect"
             student_code = extract_python_code(rollout.completion)
 
-            # Student logits → top-k
+            # Student logits -> top-k
             student_msgs = [{"role": "user", "content": question}]
             student_logits, _ = get_completion_logits(
                 model, tokenizer, student_msgs, rollout.completion,
@@ -199,60 +204,93 @@ def precompute_rollouts(
 
 
 # ---------------------------------------------------------------------------
-# GRPO loss
+# Greedy decode helper (used by both training and evaluation)
 # ---------------------------------------------------------------------------
 
-def grpo_loss_for_rollout(
+def greedy_decode_corrected(
     correction_head: CorrectionHead,
     lm_head: torch.nn.Module,
     rollout: PrecomputedRollout,
     tokenizer: AutoTokenizer,
-    group_size: int = 8,
-    temperature: float = 0.3,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute GRPO loss for one rollout.
+) -> Tuple[torch.Tensor, List[int], torch.Tensor]:
+    """Greedy decode from corrected top-k logits.
 
-    1. Forward correction head → corrections
-    2. corrected_logits = lm_head(hidden + corrections), gather top-k
-    3. Sample group_size sequences (independent per position)
-    4. Decode and execute each → rewards
-    5. Normalize advantages within the group
-    6. Loss = -mean(advantage * sequence_log_prob)
+    Returns:
+        seq_log_prob: scalar tensor (differentiable) — log P of the greedy seq
+        token_ids: list of greedy token IDs (for decoding / execution)
+        correction_norm: scalar tensor (detached) — mean L2 norm of corrections
     """
-    device = rollout.hidden_states.device
-    hidden = rollout.hidden_states        # (L, D)
-    topk_idx = rollout.topk_indices       # (L, K)
-    seq_len, top_k = topk_idx.shape
+    hidden = rollout.hidden_states   # (L, D)
+    topk_idx = rollout.topk_indices  # (L, K)
+    seq_len = hidden.shape[0]
+    device = hidden.device
 
-    # Forward correction head
     corrections = correction_head(hidden.unsqueeze(0)).squeeze(0)  # (L, D)
     corrected_hidden = hidden + corrections
 
-    # Corrected logits at top-k positions only (keeps gradient path clean)
-    corrected_logits = lm_head(corrected_hidden)               # (L, V)
-    topk_logits = corrected_logits.gather(1, topk_idx).float() # (L, K) fp32
+    corrected_logits = lm_head(corrected_hidden)                   # (L, V)
+    topk_logits = corrected_logits.gather(1, topk_idx).float()     # (L, K) fp32
+    topk_log_probs = F.log_softmax(topk_logits, dim=-1)            # (L, K)
 
-    # Probabilities over the top-k tokens
-    topk_log_probs = F.log_softmax(topk_logits / temperature, dim=-1)  # (L, K)
-    topk_probs = F.softmax(topk_logits / temperature, dim=-1)          # (L, K)
+    # Greedy: pick argmax within top-k
+    greedy_k = topk_logits.argmax(dim=-1)                          # (L,)
+    greedy_vocab = topk_idx[torch.arange(seq_len, device=device), greedy_k]
 
-    # Sample group_size tokens per position from top-k distribution
-    # multinomial: (L, group_size) — each row samples group_size indices in [0, K)
-    sampled_k = torch.multinomial(topk_probs, group_size, replacement=True)  # (L, G)
-    sampled_k = sampled_k.T  # (G, L)
+    # Truncate at EOS if present
+    eos_id = tokenizer.eos_token_id
+    active_len = seq_len
+    if eos_id is not None:
+        eos_mask = greedy_vocab == eos_id
+        if eos_mask.any():
+            active_len = eos_mask.nonzero(as_tuple=True)[0][0].item()
 
-    # Map back to vocab IDs
-    pos_range = torch.arange(seq_len, device=device)
-    sampled_vocab = topk_idx[pos_range.unsqueeze(0), sampled_k]  # (G, L)
+    # Log prob of greedy sequence (differentiable)
+    if active_len > 0:
+        seq_log_prob = topk_log_probs[:active_len][
+            torch.arange(active_len, device=device), greedy_k[:active_len]
+        ].sum()
+    else:
+        seq_log_prob = torch.tensor(0.0, device=device, requires_grad=True)
 
-    # Per-token log probs (differentiable)
-    per_token_lp = topk_log_probs[pos_range.unsqueeze(0), sampled_k]  # (G, L)
-    seq_log_probs = per_token_lp.sum(dim=-1)                          # (G,)
+    token_ids = greedy_vocab[:active_len].tolist()
+    corr_norm = corrections.detach().norm(dim=-1).mean()
 
-    # Decode and evaluate each group member
+    return seq_log_prob, token_ids, corr_norm
+
+
+# ---------------------------------------------------------------------------
+# GRPO loss (cross-rollout within a problem)
+# ---------------------------------------------------------------------------
+
+def grpo_loss_for_problem(
+    correction_head: CorrectionHead,
+    lm_head: torch.nn.Module,
+    rollouts: List[PrecomputedRollout],
+    tokenizer: AutoTokenizer,
+) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+    """Compute GRPO loss across all rollouts of one problem.
+
+    1. For each rollout: greedy-decode the corrected sequence, execute, get reward
+    2. Normalize advantages across rollouts (the GRPO "group")
+    3. Loss = -mean(advantage * seq_log_prob)
+
+    Returns None for loss if the problem has < 2 rollouts or uniform rewards.
+    """
+    if len(rollouts) < 2:
+        return None, {}
+
+    device = rollouts[0].hidden_states.device
+    seq_log_probs: List[torch.Tensor] = []
     rewards: List[float] = []
-    for g in range(group_size):
-        token_ids = sampled_vocab[g].tolist()
+    norms: List[float] = []
+
+    for rollout in rollouts:
+        seq_lp, token_ids, corr_norm = greedy_decode_corrected(
+            correction_head, lm_head, rollout, tokenizer,
+        )
+        seq_log_probs.append(seq_lp)
+        norms.append(corr_norm.item())
+
         text = tokenizer.decode(token_ids, skip_special_tokens=True)
         try:
             fb = get_environment_feedback(
@@ -265,22 +303,31 @@ def grpo_loss_for_rollout(
         rewards.append(r)
 
     rewards_t = torch.tensor(rewards, device=device, dtype=torch.float32)
+    seq_lp_t = torch.stack(seq_log_probs)  # (N,)
 
-    # GRPO: group-normalised advantages
+    # GRPO: group-normalised advantages across rollouts
     reward_std = rewards_t.std()
-    if reward_std > 1e-8:
-        advantages = (rewards_t - rewards_t.mean()) / (reward_std + 1e-8)
-    else:
-        advantages = torch.zeros_like(rewards_t)
+    if reward_std < 1e-8:
+        # All rewards identical — no gradient signal for this problem
+        return None, {
+            "loss": 0.0,
+            "mean_reward": rewards_t.mean().item(),
+            "max_reward": rewards_t.max().item(),
+            "correction_norm": sum(norms) / len(norms),
+            "reward_std": 0.0,
+            "n_rollouts": len(rollouts),
+        }
 
-    loss = -(advantages.detach() * seq_log_probs).mean()
+    advantages = (rewards_t - rewards_t.mean()) / (reward_std + 1e-8)
+    loss = -(advantages.detach() * seq_lp_t).mean()
 
     metrics = {
         "loss": loss.item(),
         "mean_reward": rewards_t.mean().item(),
         "max_reward": rewards_t.max().item(),
-        "correction_norm": corrections.detach().norm(dim=-1).mean().item(),
+        "correction_norm": sum(norms) / len(norms),
         "reward_std": reward_std.item(),
+        "n_rollouts": len(rollouts),
     }
     return loss, metrics
 
@@ -308,7 +355,7 @@ def evaluate_greedy(
         corrected_hidden = hidden + corrections
         corrected_logits = lm_head(corrected_hidden)
 
-        # Mask to top-k
+        # Mask to top-k (+ EOS for cleaner outputs)
         topk_logits = corrected_logits.gather(1, topk_idx)
         masked = torch.full_like(corrected_logits, float("-inf"))
         masked.scatter_(1, topk_idx, topk_logits)
@@ -374,7 +421,7 @@ def evaluate_greedy(
 def run_experiment_8(
     model_name: str = "Qwen/Qwen3-1.7B",
     num_problems: int = 10,
-    num_rollouts: int = 4,
+    num_rollouts: int = 8,
     temperature: float = 1.0,
     max_new_tokens: int = 4096,
     top_k: int = 20,
@@ -382,14 +429,12 @@ def run_experiment_8(
     head_num_layers: int = 2,
     head_num_heads: int = 16,
     head_ff_mult: int = 4,
-    head_init_scale: float = 0.01,
-    # GRPO
-    group_size: int = 8,
-    sampling_temperature: float = 0.3,
+    head_init_scale: float = 0.001,
+    # Training
     learning_rate: float = 1e-4,
     max_grad_norm: float = 1.0,
-    num_epochs: int = 10,
-    eval_every: int = 2,
+    num_epochs: int = 20,
+    eval_every: int = 5,
     # Output
     output_dir: str = "analysis/results",
 ) -> Dict[str, Any]:
@@ -400,7 +445,7 @@ def run_experiment_8(
     print(f"Model: {model_name}")
     print(f"Problems: {num_problems} | Rollouts/problem: {num_rollouts}")
     print(f"Head: {head_num_layers} layers, {head_num_heads} heads")
-    print(f"GRPO: group={group_size}, temp={sampling_temperature}")
+    print(f"GRPO: cross-rollout (group = all rollouts per problem)")
     print(f"Training: lr={learning_rate}, epochs={num_epochs}")
     print("=" * 60)
     print()
@@ -436,6 +481,8 @@ def run_experiment_8(
     ).to(device=model.device, dtype=torch.bfloat16)
 
     print(f"Correction head: {head.num_parameters():,} parameters")
+    print(f"Initial gate value: softplus({head.gate_logit.item():.2f}) "
+          f"= {F.softplus(head.gate_logit).item():.4f}")
     print()
 
     # ------------------------------------------------------------------
@@ -456,7 +503,17 @@ def run_experiment_8(
     n_correct = sum(1 for r in all_rollouts if r.category == "correct")
     n_incorrect = n_total - n_correct
     print(f"\nPre-computed {n_total} rollouts "
-          f"(correct={n_correct}, incorrect={n_incorrect})\n")
+          f"(correct={n_correct}, incorrect={n_incorrect})")
+
+    # Report which problems have reward variance (will produce gradient)
+    for prob_idx, rollouts in by_problem.items():
+        rewards = [r.reward for r in rollouts]
+        has_var = len(set(rewards)) > 1
+        title = rollouts[0].example.get("question_title", f"P{prob_idx}") if rollouts else f"P{prob_idx}"
+        print(f"  Problem {prob_idx} ({title}): "
+              f"rewards={[f'{r:.1f}' for r in rewards]} "
+              f"{'<-- has variance' if has_var else '(uniform, no gradient)'}")
+    print()
 
     if n_total == 0:
         print("No rollouts to train on. Exiting.")
@@ -499,51 +556,45 @@ def run_experiment_8(
         random.shuffle(problem_indices)
 
         epoch_losses, epoch_rewards, epoch_norms = [], [], []
+        problems_with_grad = 0
 
         for prob_idx in problem_indices:
             rollouts = by_problem[prob_idx]
-            if not rollouts:
+            if len(rollouts) < 2:
                 continue
 
             head.train()
             optimizer.zero_grad()
-            batch_loss = 0.0
-            batch_metrics: Dict[str, List[float]] = {
-                "loss": [], "mean_reward": [], "max_reward": [],
-                "correction_norm": [], "reward_std": [],
-            }
 
-            for rollout in rollouts:
-                loss, metrics = grpo_loss_for_rollout(
-                    head, lm_head, rollout, tokenizer,
-                    group_size=group_size,
-                    temperature=sampling_temperature,
-                )
-                (loss / len(rollouts)).backward()
-                batch_loss += loss.item()
-                for k, v in metrics.items():
-                    batch_metrics[k].append(v)
+            loss, metrics = grpo_loss_for_problem(
+                head, lm_head, rollouts, tokenizer,
+            )
 
-            torch.nn.utils.clip_grad_norm_(head.parameters(), max_grad_norm)
-            optimizer.step()
+            if loss is not None:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(head.parameters(), max_grad_norm)
+                optimizer.step()
+                problems_with_grad += 1
+
             global_step += 1
-
-            avg = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
-            epoch_losses.append(avg["loss"])
-            epoch_rewards.append(avg["mean_reward"])
-            epoch_norms.append(avg["correction_norm"])
+            epoch_losses.append(metrics.get("loss", 0.0))
+            epoch_rewards.append(metrics.get("mean_reward", 0.0))
+            epoch_norms.append(metrics.get("correction_norm", 0.0))
 
             step_history.append({
                 "epoch": epoch, "step": global_step,
-                "problem_idx": prob_idx, **avg,
+                "problem_idx": prob_idx, **metrics,
             })
 
         # Epoch summary
+        gate_val = F.softplus(head.gate_logit).item()
         if epoch_losses:
             print(
                 f"  loss={sum(epoch_losses)/len(epoch_losses):.4f}  "
                 f"reward={sum(epoch_rewards)/len(epoch_rewards):.3f}  "
-                f"norm={sum(epoch_norms)/len(epoch_norms):.4f}"
+                f"norm={sum(epoch_norms)/len(epoch_norms):.4f}  "
+                f"gate={gate_val:.4f}  "
+                f"grad_problems={problems_with_grad}/{len(problem_indices)}"
             )
 
         # Periodic evaluation
@@ -583,7 +634,7 @@ def run_experiment_8(
         print(
             f"  P{r['problem_idx']}/R{r['rollout_idx']} "
             f"({r['category']:<9s}) "
-            f"orig={r['original_reward']:.2f} → "
+            f"orig={r['original_reward']:.2f} -> "
             f"corr={r['corrected_reward']:.2f} "
             f"[{marker}] norm={r['correction_norm']:.4f}"
         )
@@ -613,8 +664,6 @@ def run_experiment_8(
             "head_ff_mult": head_ff_mult,
             "head_init_scale": head_init_scale,
             "head_parameters": head.num_parameters(),
-            "group_size": group_size,
-            "sampling_temperature": sampling_temperature,
             "learning_rate": learning_rate,
             "max_grad_norm": max_grad_norm,
             "num_epochs": num_epochs,
@@ -641,7 +690,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--num-problems", type=int, default=10)
-    parser.add_argument("--num-rollouts", type=int, default=4)
+    parser.add_argument("--num-rollouts", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--top-k", type=int, default=20)
@@ -649,14 +698,12 @@ if __name__ == "__main__":
     parser.add_argument("--head-num-layers", type=int, default=2)
     parser.add_argument("--head-num-heads", type=int, default=16)
     parser.add_argument("--head-ff-mult", type=int, default=4)
-    parser.add_argument("--head-init-scale", type=float, default=0.01)
-    # GRPO
-    parser.add_argument("--group-size", type=int, default=8)
-    parser.add_argument("--sampling-temperature", type=float, default=0.3)
+    parser.add_argument("--head-init-scale", type=float, default=0.001)
+    # Training
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--num-epochs", type=int, default=10)
-    parser.add_argument("--eval-every", type=int, default=2)
+    parser.add_argument("--num-epochs", type=int, default=20)
+    parser.add_argument("--eval-every", type=int, default=5)
     # Output
     parser.add_argument("--output-dir", type=str, default="analysis/results")
     args = parser.parse_args()
@@ -672,8 +719,6 @@ if __name__ == "__main__":
         head_num_heads=args.head_num_heads,
         head_ff_mult=args.head_ff_mult,
         head_init_scale=args.head_init_scale,
-        group_size=args.group_size,
-        sampling_temperature=args.sampling_temperature,
         learning_rate=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         num_epochs=args.num_epochs,
