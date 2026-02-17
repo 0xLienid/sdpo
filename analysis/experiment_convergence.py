@@ -385,12 +385,20 @@ def compute_reasoning_augmented_loss(
         teacher_full_text = tokenizer.apply_chat_template(
             teacher_full_messages, tokenize=False, add_generation_prompt=False)
 
-        # Find where the completion starts: prefix = user context + assistant start + reasoning
-        teacher_prefix_text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": teacher_context}],
-            tokenize=False, add_generation_prompt=True) + reasoning_text + "\n\n"
-        teacher_prefix_len = len(tokenizer(
-            teacher_prefix_text, truncation=True, max_length=max_seq_length, padding=False).input_ids)
+        # Find where the completion starts in the teacher sequence.
+        # Build a "reasoning-only" version via chat template, then subtract the
+        # trailing <|im_end|> token to get the prefix length.
+        teacher_reasoning_only_messages = [
+            {"role": "user", "content": teacher_context},
+            {"role": "assistant", "content": reasoning_text + "\n\n"},
+        ]
+        teacher_reasoning_only_text = tokenizer.apply_chat_template(
+            teacher_reasoning_only_messages, tokenize=False, add_generation_prompt=False)
+        teacher_reasoning_only_len = len(tokenizer(
+            teacher_reasoning_only_text, truncation=True, max_length=max_seq_length, padding=False).input_ids)
+        # The reasoning-only template ends with <|im_end|> (1 token) that isn't
+        # at that position in the full template. Subtract it to get the real prefix.
+        teacher_prefix_len = teacher_reasoning_only_len - 1
 
         # --- Step 3: Build student sequence ---
         student_messages = build_student_messages(prompts[i], completions[i])
@@ -418,6 +426,11 @@ def compute_reasoning_augmented_loss(
         comp_len = min(s_comp_len, t_comp_len)
 
         if comp_len <= 0:
+            logger.warning(
+                f"  Rollout {i}: comp_len={comp_len} (s_seq={s_seq_len}, "
+                f"s_prompt={student_prompt_len}, t_seq={t_seq_len}, "
+                f"t_prefix={teacher_prefix_len}, reasoning_len={len(reasoning_text)})"
+            )
             all_comp_lens.append(0)
             all_student_topk.append(None)
             all_teacher_topk.append(None)
@@ -576,6 +589,8 @@ def run_condition(
             model.train()
 
             # Get feedback
+            # Use raw question text, NOT rollout.prompt (which is already
+            # chat-template-formatted and would get double-wrapped)
             prompts_list = []
             completions_list = []
             feedbacks_list = []
@@ -585,7 +600,7 @@ def run_condition(
             for rollout in rollouts:
                 fb = get_environment_feedback(
                     prompt=rollout.prompt, completion=rollout.completion, example=example)
-                prompts_list.append(rollout.prompt)
+                prompts_list.append(question)
                 completions_list.append(rollout.completion)
                 feedbacks_list.append(fb.feedback_text)
                 student_codes_list.append(extract_python_code(rollout.completion))
