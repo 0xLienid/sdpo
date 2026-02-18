@@ -317,11 +317,15 @@ def compute_reasoning_augmented_loss(
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Teacher generates reasoning about corrections, then evaluates the student's
-    completion with that reasoning as context.
+    completion with that reasoning as additional context in the user prompt.
 
-    Teacher: model(question + code + feedback, reasoning, completion)
-    Student: model(question, completion)
+    Teacher: model(question + code + feedback + reasoning | completion)
+    Student: model(question | completion)
     Distill on the completion tokens only.
+
+    Reasoning is placed in the user prompt (not the assistant turn) so that
+    both student and teacher go through apply_chat_template uniformly,
+    ensuring identical completion tokenization on both sides.
     """
     device = next(student_model.parameters()).device
     teacher_device = next(teacher_model.parameters()).device
@@ -368,42 +372,36 @@ def compute_reasoning_augmented_loss(
         reasoning_text = tokenizer.decode(reasoning_ids, skip_special_tokens=True)
         del reasoning_output, reasoning_inputs
 
-        # --- Step 2: Build teacher sequence (reasoning + completion as one assistant turn) ---
-        # IMPORTANT: We bypass apply_chat_template for assistant content because
-        # Qwen3's template has special </think> handling that splits on </think>
-        # and drops content after the second occurrence. Since both reasoning_text
-        # and the completion contain </think> tags, the template would mangle the
-        # combined content. Instead, we get the user turn + generation prompt via
-        # the template, then manually append the assistant content.
+        # --- Step 2: Build teacher messages with reasoning in user prompt ---
         teacher_context = (
             f"## Question\n{prompts[i]}\n\n"
             f"## Previous Attempt\n```python\n{student_codes[i]}\n```\n\n"
             f"## Feedback (from environment) for the previous attempt\n{feedbacks[i]}\n\n"
+            f"## Analysis of Previous Attempt and Guidance for Improvement\n{reasoning_text}\n\n"
             f"Use the context above to inform your approach, but treat your attempt "
             f"as an attempt from scratch. Do not reference the previous attempt in "
             f"your solution, just use it and its feedback as guidance. Write a correct "
             f"solution to the question. Put your code in a ```python{{code}}``` block."
         )
-        teacher_user_text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": teacher_context}],
-            tokenize=False, add_generation_prompt=True)
-        teacher_full_text = teacher_user_text + reasoning_text + "\n\n" + completions[i]
+        teacher_msgs = [
+            {"role": "user", "content": teacher_context},
+            {"role": "assistant", "content": completions[i]},
+        ]
+        teacher_full_text = tokenizer.apply_chat_template(
+            teacher_msgs, tokenize=False, add_generation_prompt=False)
+        teacher_prompt_text = tokenizer.apply_chat_template(
+            [teacher_msgs[0]], tokenize=False, add_generation_prompt=True)
 
-        # Find where the completion starts in the teacher sequence.
-        # The prefix is everything up to where the completion begins:
-        # user turn + generation prompt + reasoning + separator
-        teacher_prefix_text = teacher_user_text + reasoning_text + "\n\n"
-        teacher_prefix_len = len(tokenizer(
-            teacher_prefix_text, truncation=True, max_length=max_seq_length, padding=False).input_ids)
-
-        # --- Step 3: Build student sequence ---
-        # Also bypass apply_chat_template for assistant content (same </think> issue)
-        student_user_text = tokenizer.apply_chat_template(
+        # --- Step 3: Build student messages (standard) ---
+        student_msgs = [
+            {"role": "user", "content": prompts[i]},
+            {"role": "assistant", "content": completions[i]},
+        ]
+        student_full_text = tokenizer.apply_chat_template(
+            student_msgs, tokenize=False, add_generation_prompt=False)
+        student_prompt_text = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompts[i]}],
             tokenize=False, add_generation_prompt=True)
-        student_full_text = student_user_text + completions[i]
-        student_prompt_len = len(tokenizer(
-            student_user_text, truncation=True, max_length=max_seq_length, padding=False).input_ids)
 
         # Tokenize
         student_enc = tokenizer(
@@ -413,18 +411,25 @@ def compute_reasoning_augmented_loss(
             teacher_full_text, return_tensors="pt", truncation=True,
             max_length=max_seq_length, padding=False).to(teacher_device)
 
-        # Completion lengths
+        student_prompt_len = len(tokenizer(
+            student_prompt_text, truncation=True, max_length=max_seq_length,
+            padding=False).input_ids)
+        teacher_prompt_len = len(tokenizer(
+            teacher_prompt_text, truncation=True, max_length=max_seq_length,
+            padding=False).input_ids)
+
+        # Completion lengths (subtract 1 for trailing <|im_end|> in template output)
         s_seq_len = student_enc.input_ids.shape[1]
         t_seq_len = teacher_enc.input_ids.shape[1]
         s_comp_len = s_seq_len - student_prompt_len
-        t_comp_len = t_seq_len - teacher_prefix_len
+        t_comp_len = t_seq_len - teacher_prompt_len
         comp_len = min(s_comp_len, t_comp_len)
 
         if comp_len <= 0:
             logger.warning(
                 f"  Rollout {i}: comp_len={comp_len} (s_seq={s_seq_len}, "
                 f"s_prompt={student_prompt_len}, t_seq={t_seq_len}, "
-                f"t_prefix={teacher_prefix_len}, reasoning_len={len(reasoning_text)})"
+                f"t_prompt={teacher_prompt_len}, reasoning_len={len(reasoning_text)})"
             )
             all_comp_lens.append(0)
             all_student_topk.append(None)
@@ -448,7 +453,7 @@ def compute_reasoning_augmented_loss(
 
         with torch.no_grad():
             teacher_out = teacher_model(**teacher_enc)
-            t_logits = teacher_out.logits[0, teacher_prefix_len - 1:teacher_prefix_len - 1 + comp_len, :]
+            t_logits = teacher_out.logits[0, teacher_prompt_len - 1:teacher_prompt_len - 1 + comp_len, :]
             t_logits = t_logits.to(device)
             t_scaled = t_logits / hparams.temperature
             t_topk = torch.gather(t_scaled, -1, topk_idx)
@@ -532,14 +537,14 @@ def run_condition(
     # Hparams for loss computation — sequence lengths depend on condition
     # with_thinking: teacher prompt contains the full completion (~4096 tokens)
     #   plus question + feedback, so prompt can be ~6000 tokens
-    # reasoning_augmented: teacher response contains reasoning (~512) + completion (~4096)
-    #   so response can be ~5000 tokens; also reasoning generation prompt needs ~4096
+    # reasoning_augmented: teacher prompt contains question + code + feedback +
+    #   reasoning (~512 tokens), so prompt needs ~1024 extra
     if condition == "with_thinking":
         max_prompt = max_new_tokens + 2048  # full completion + question/feedback/instruction
         max_response = max_new_tokens
     elif condition == "reasoning_augmented":
-        max_prompt = max_new_tokens  # question + code + feedback
-        max_response = max_new_tokens + 1024  # reasoning + completion
+        max_prompt = max_new_tokens + 1024  # question + code + feedback + reasoning
+        max_response = max_new_tokens
     else:
         max_prompt = max_new_tokens  # question + extracted code + feedback
         max_response = max_new_tokens
