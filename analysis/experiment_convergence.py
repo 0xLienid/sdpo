@@ -369,6 +369,12 @@ def compute_reasoning_augmented_loss(
         del reasoning_output, reasoning_inputs
 
         # --- Step 2: Build teacher sequence (reasoning + completion as one assistant turn) ---
+        # IMPORTANT: We bypass apply_chat_template for assistant content because
+        # Qwen3's template has special </think> handling that splits on </think>
+        # and drops content after the second occurrence. Since both reasoning_text
+        # and the completion contain </think> tags, the template would mangle the
+        # combined content. Instead, we get the user turn + generation prompt via
+        # the template, then manually append the assistant content.
         teacher_context = (
             f"## Question\n{prompts[i]}\n\n"
             f"## Previous Attempt\n```python\n{student_codes[i]}\n```\n\n"
@@ -378,37 +384,26 @@ def compute_reasoning_augmented_loss(
             f"your solution, just use it and its feedback as guidance. Write a correct "
             f"solution to the question. Put your code in a ```python{{code}}``` block."
         )
-        teacher_full_messages = [
-            {"role": "user", "content": teacher_context},
-            {"role": "assistant", "content": reasoning_text + "\n\n" + completions[i]},
-        ]
-        teacher_full_text = tokenizer.apply_chat_template(
-            teacher_full_messages, tokenize=False, add_generation_prompt=False)
+        teacher_user_text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": teacher_context}],
+            tokenize=False, add_generation_prompt=True)
+        teacher_full_text = teacher_user_text + reasoning_text + "\n\n" + completions[i]
 
         # Find where the completion starts in the teacher sequence.
-        # Build a "reasoning-only" version via chat template, then subtract the
-        # trailing <|im_end|> token to get the prefix length.
-        teacher_reasoning_only_messages = [
-            {"role": "user", "content": teacher_context},
-            {"role": "assistant", "content": reasoning_text + "\n\n"},
-        ]
-        teacher_reasoning_only_text = tokenizer.apply_chat_template(
-            teacher_reasoning_only_messages, tokenize=False, add_generation_prompt=False)
-        teacher_reasoning_only_len = len(tokenizer(
-            teacher_reasoning_only_text, truncation=True, max_length=max_seq_length, padding=False).input_ids)
-        # The reasoning-only template ends with <|im_end|> (1 token) that isn't
-        # at that position in the full template. Subtract it to get the real prefix.
-        teacher_prefix_len = teacher_reasoning_only_len - 1
+        # The prefix is everything up to where the completion begins:
+        # user turn + generation prompt + reasoning + separator
+        teacher_prefix_text = teacher_user_text + reasoning_text + "\n\n"
+        teacher_prefix_len = len(tokenizer(
+            teacher_prefix_text, truncation=True, max_length=max_seq_length, padding=False).input_ids)
 
         # --- Step 3: Build student sequence ---
-        student_messages = build_student_messages(prompts[i], completions[i])
-        student_full_text = tokenizer.apply_chat_template(
-            student_messages, tokenize=False, add_generation_prompt=False)
-        student_prompt_only = tokenizer.apply_chat_template(
+        # Also bypass apply_chat_template for assistant content (same </think> issue)
+        student_user_text = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompts[i]}],
             tokenize=False, add_generation_prompt=True)
+        student_full_text = student_user_text + completions[i]
         student_prompt_len = len(tokenizer(
-            student_prompt_only, truncation=True, max_length=max_seq_length, padding=False).input_ids)
+            student_user_text, truncation=True, max_length=max_seq_length, padding=False).input_ids)
 
         # Tokenize
         student_enc = tokenizer(
