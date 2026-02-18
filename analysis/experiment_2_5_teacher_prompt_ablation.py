@@ -1,12 +1,14 @@
 """
 Experiment 2.5: Teacher Prompt Ablation — KL Distribution
 
-Compares KL(student || teacher) across sequence positions under three teacher
+Compares KL(student || teacher) across sequence positions under four teacher
 prompt configurations:
 
   1. code_only   — teacher sees question + extracted code + feedback (current SDPO)
   2. no_attempt  — teacher sees question + feedback only (no prior attempt)
   3. with_thinking — teacher sees question + full completion (thinking + code) + feedback
+  4. reasoning_augmented — teacher first generates reasoning about corrections (with
+     /no_think), then that reasoning precedes the completion in the teacher context
 
 Tests whether including the student's prior attempt in the teacher prompt
 contributes to the positional KL degradation ("prefix corruption").
@@ -37,7 +39,7 @@ from data_modules.livecodebench.rollout import livecodebench_rollout
 
 logger = logging.getLogger(__name__)
 
-ATTEMPT_MODES = ["code_only", "no_attempt", "with_thinking"]
+ATTEMPT_MODES = ["code_only", "no_attempt", "with_thinking", "reasoning_augmented"]
 
 
 def build_teacher_messages_ablation(
@@ -96,9 +98,10 @@ def compute_ablation_kls(
     top_k: int = 20,
     temperature: float = 1.0,
     full_dist: bool = False,
+    max_seq_length: int = 10240,
 ) -> Dict[str, Any]:
     """
-    Compute KL(student || teacher) under all three teacher prompt conditions.
+    Compute KL(student || teacher) under all four teacher prompt conditions.
 
     The student side is always model(completion | question) — identical across
     conditions. The teacher side varies by what context precedes the completion.
@@ -114,16 +117,22 @@ def compute_ablation_kls(
 
     results = {}
     for mode in ATTEMPT_MODES:
-        teacher_full = build_teacher_messages_ablation(
-            prompt=question, completion=completion,
-            feedback=feedback_text, attempt_mode=mode,
-            student_code=student_code, full_completion=full_completion,
-        )
-        teacher_msgs = [teacher_full[0]]  # just the user turn
+        if mode == "reasoning_augmented":
+            teacher_logits = _compute_reasoning_augmented_teacher_logits(
+                model, tokenizer, question, completion,
+                feedback_text, student_code, max_seq_length,
+            )
+        else:
+            teacher_full = build_teacher_messages_ablation(
+                prompt=question, completion=completion,
+                feedback=feedback_text, attempt_mode=mode,
+                student_code=student_code, full_completion=full_completion,
+            )
+            teacher_msgs = [teacher_full[0]]  # just the user turn
 
-        teacher_logits, _ = get_completion_logits(
-            model, tokenizer, teacher_msgs, completion,
-        )
+            teacher_logits, _ = get_completion_logits(
+                model, tokenizer, teacher_msgs, completion,
+            )
 
         if full_dist:
             kl = kl_fn(student_logits, teacher_logits, temperature)
@@ -139,6 +148,88 @@ def compute_ablation_kls(
         }
 
     return results
+
+
+def _compute_reasoning_augmented_teacher_logits(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    question: str,
+    completion: str,
+    feedback_text: str,
+    student_code: str,
+    max_seq_length: int = 10240,
+) -> torch.Tensor:
+    """
+    Generate reasoning about corrections, then compute teacher logits with
+    reasoning prepended to the completion.
+
+    Bypasses apply_chat_template for assistant content to avoid Qwen3's
+    </think> tag handling which drops content after the second </think>.
+
+    Returns:
+        teacher_logits: (completion_len, vocab_size)
+    """
+    # --- Step 1: Generate reasoning with /no_think ---
+    reasoning_prompt = (
+        f"Analyze this student's attempt and explain what corrections are needed.\n\n"
+        f"## Question\n{question}\n\n"
+        f"## Student Code\n```python\n{student_code}\n```\n\n"
+        f"## Feedback\n{feedback_text}\n\n/no_think"
+    )
+    reasoning_messages = [{"role": "user", "content": reasoning_prompt}]
+    reasoning_input_text = tokenizer.apply_chat_template(
+        reasoning_messages, tokenize=False, add_generation_prompt=True)
+    reasoning_inputs = tokenizer(
+        reasoning_input_text, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=False).to(model.device)
+
+    with torch.no_grad():
+        reasoning_output = model.generate(
+            **reasoning_inputs,
+            max_new_tokens=512,
+            do_sample=True, temperature=0.7, top_p=0.95,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    reasoning_ids = reasoning_output[0, reasoning_inputs.input_ids.shape[1]:]
+    reasoning_text = tokenizer.decode(reasoning_ids, skip_special_tokens=True)
+    del reasoning_output, reasoning_inputs
+
+    # --- Step 2: Build teacher sequence manually (bypass apply_chat_template) ---
+    # Qwen3's template splits on </think> and drops content after the second
+    # occurrence. Since reasoning_text and completion both contain </think>,
+    # we must bypass the template for assistant content.
+    teacher_context = (
+        f"## Question\n{question}\n\n"
+        f"## Previous Attempt\n```python\n{student_code}\n```\n\n"
+        f"## Feedback (from environment) for the previous attempt\n{feedback_text}\n\n"
+        f"Use the context above to inform your approach, but treat your attempt "
+        f"as an attempt from scratch. Do not reference the previous attempt in "
+        f"your solution, just use it and its feedback as guidance. Write a correct "
+        f"solution to the question. Put your code in a ```python{{code}}``` block."
+    )
+    teacher_user_text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": teacher_context}],
+        tokenize=False, add_generation_prompt=True)
+    teacher_full_text = teacher_user_text + reasoning_text + "\n\n" + completion
+    teacher_prefix_text = teacher_user_text + reasoning_text + "\n\n"
+
+    teacher_enc = tokenizer(
+        teacher_full_text, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=False).to(model.device)
+    teacher_prefix_len = len(tokenizer(
+        teacher_prefix_text, truncation=True, max_length=max_seq_length,
+        padding=False).input_ids)
+
+    # --- Step 3: Forward pass and extract completion logits ---
+    with torch.no_grad():
+        teacher_out = model(**teacher_enc)
+
+    t_seq_len = teacher_enc.input_ids.shape[1]
+    teacher_logits = teacher_out.logits[0, teacher_prefix_len - 1: t_seq_len - 1, :]
+    del teacher_out, teacher_enc
+
+    return teacher_logits
 
 
 def aggregate_ventiles(
@@ -260,7 +351,7 @@ def run_experiment_2_5(
 
             print(
                 f"  Rollout {r_idx}: reward={rewards[r_idx]:.2f} "
-                f"{'correct' if correct else 'incorrect'} — computing KL (3 conditions)..."
+                f"{'correct' if correct else 'incorrect'} — computing KL ({len(ATTEMPT_MODES)} conditions)..."
             )
 
             kl_results = compute_ablation_kls(
@@ -434,11 +525,14 @@ def run_experiment_2_5(
         plt.close()
         print(f"Plot saved to: {plot_path}")
 
-        # Overlay plot: all three modes on one axis, per stratum
+        # Overlay plot: all modes on one axis, per stratum
         fig2, axes2 = plt.subplots(
             1, num_rows, figsize=(8 * num_rows, 5), squeeze=False,
         )
-        colors = {"code_only": "#2196F3", "no_attempt": "#4CAF50", "with_thinking": "#FF5722"}
+        colors = {
+            "code_only": "#2196F3", "no_attempt": "#4CAF50",
+            "with_thinking": "#FF5722", "reasoning_augmented": "#9C27B0",
+        }
 
         for col, (stratum_name, data) in enumerate(plot_strata.items()):
             ax = axes2[0][col]
