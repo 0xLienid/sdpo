@@ -118,7 +118,12 @@ def compute_ablation_kls(
     results = {}
     for mode in ATTEMPT_MODES:
         if mode == "reasoning_augmented":
-            teacher_logits = _compute_reasoning_augmented_teacher_logits(
+            # reasoning_augmented bypasses apply_chat_template for the teacher's
+            # assistant content (to avoid Qwen3's </think> mangling). We must
+            # also bypass it for the student side so both tokenize the completion
+            # identically — Qwen3's template reformats <think> tags (adds
+            # newlines), which would misalign the completion tokens.
+            s_logits, t_logits = _compute_reasoning_augmented_kl_logits(
                 model, tokenizer, question, completion,
                 feedback_text, student_code, max_seq_length,
             )
@@ -130,14 +135,15 @@ def compute_ablation_kls(
             )
             teacher_msgs = [teacher_full[0]]  # just the user turn
 
-            teacher_logits, _ = get_completion_logits(
+            t_logits, _ = get_completion_logits(
                 model, tokenizer, teacher_msgs, completion,
             )
+            s_logits = student_logits
 
         if full_dist:
-            kl = kl_fn(student_logits, teacher_logits, temperature)
+            kl = kl_fn(s_logits, t_logits, temperature)
         else:
-            kl = kl_fn(student_logits, teacher_logits, top_k, temperature)
+            kl = kl_fn(s_logits, t_logits, top_k, temperature)
 
         min_len = len(kl)
         results[mode] = {
@@ -150,7 +156,7 @@ def compute_ablation_kls(
     return results
 
 
-def _compute_reasoning_augmented_teacher_logits(
+def _compute_reasoning_augmented_kl_logits(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     question: str,
@@ -158,16 +164,18 @@ def _compute_reasoning_augmented_teacher_logits(
     feedback_text: str,
     student_code: str,
     max_seq_length: int = 10240,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Generate reasoning about corrections, then compute teacher logits with
-    reasoning prepended to the completion.
+    Generate reasoning about corrections, then compute both student and teacher
+    logits over the completion tokens.
 
-    Bypasses apply_chat_template for assistant content to avoid Qwen3's
-    </think> tag handling which drops content after the second </think>.
+    Both sequences bypass apply_chat_template for assistant content to ensure
+    the completion is tokenized identically on both sides. This avoids:
+    1. Qwen3's </think> mangling (drops content after second </think>)
+    2. Qwen3's <think> reformatting (adds newlines) which would misalign tokens
 
     Returns:
-        teacher_logits: (completion_len, vocab_size)
+        (student_logits, teacher_logits): each (completion_len, vocab_size)
     """
     # --- Step 1: Generate reasoning with /no_think ---
     reasoning_prompt = (
@@ -195,10 +203,14 @@ def _compute_reasoning_augmented_teacher_logits(
     reasoning_text = tokenizer.decode(reasoning_ids, skip_special_tokens=True)
     del reasoning_output, reasoning_inputs
 
-    # --- Step 2: Build teacher sequence manually (bypass apply_chat_template) ---
-    # Qwen3's template splits on </think> and drops content after the second
-    # occurrence. Since reasoning_text and completion both contain </think>,
-    # we must bypass the template for assistant content.
+    # --- Step 2: Build both sequences manually (bypass apply_chat_template) ---
+    # Both student and teacher append the raw completion text so the completion
+    # tokens are identical on both sides.
+    student_user_text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": question}],
+        tokenize=False, add_generation_prompt=True)
+    student_full_text = student_user_text + completion
+
     teacher_context = (
         f"## Question\n{question}\n\n"
         f"## Previous Attempt\n```python\n{student_code}\n```\n\n"
@@ -214,6 +226,14 @@ def _compute_reasoning_augmented_teacher_logits(
     teacher_full_text = teacher_user_text + reasoning_text + "\n\n" + completion
     teacher_prefix_text = teacher_user_text + reasoning_text + "\n\n"
 
+    # Tokenize
+    student_enc = tokenizer(
+        student_full_text, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=False).to(model.device)
+    student_prompt_len = len(tokenizer(
+        student_user_text, truncation=True, max_length=max_seq_length,
+        padding=False).input_ids)
+
     teacher_enc = tokenizer(
         teacher_full_text, return_tensors="pt", truncation=True,
         max_length=max_seq_length, padding=False).to(model.device)
@@ -221,15 +241,21 @@ def _compute_reasoning_augmented_teacher_logits(
         teacher_prefix_text, truncation=True, max_length=max_seq_length,
         padding=False).input_ids)
 
-    # --- Step 3: Forward pass and extract completion logits ---
+    # --- Step 3: Forward passes and extract completion logits ---
     with torch.no_grad():
+        student_out = model(**student_enc)
+        s_seq_len = student_enc.input_ids.shape[1]
+        student_logits = student_out.logits[0, student_prompt_len - 1: s_seq_len - 1, :]
+        del student_out
+
         teacher_out = model(**teacher_enc)
+        t_seq_len = teacher_enc.input_ids.shape[1]
+        teacher_logits = teacher_out.logits[0, teacher_prefix_len - 1: t_seq_len - 1, :]
+        del teacher_out
 
-    t_seq_len = teacher_enc.input_ids.shape[1]
-    teacher_logits = teacher_out.logits[0, teacher_prefix_len - 1: t_seq_len - 1, :]
-    del teacher_out, teacher_enc
+    del student_enc, teacher_enc
 
-    return teacher_logits
+    return student_logits, teacher_logits
 
 
 def aggregate_ventiles(
