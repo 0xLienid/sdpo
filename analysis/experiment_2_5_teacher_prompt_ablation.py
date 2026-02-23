@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from analysis.experiment_1_reward_on_regen import compute_reward
@@ -92,12 +93,11 @@ def build_teacher_messages_ablation(
         )
 
     parts.append(
-        "Use the context above to inform your approach, but treat your "
-        "attempt as an attempt from scratch. Do not reference the previous "
-        "attempt in your solution, just use it and its feedback as guidance. "
-        "Write a correct solution to the question. Put your code in a "
-        "```python{{code}}``` block."
+        "Correctly solve the original question."
     )
+
+    if attempt_mode == "reasoning_in_response_thinking":
+        completion = f"{reasoning_text}\n\n{completion}"
 
     return [
         {"role": "user", "content": "\n\n".join(parts)},
@@ -115,10 +115,10 @@ def _generate_reasoning(
 ) -> str:
     """Generate reasoning about corrections using /no_think."""
     reasoning_prompt = (
-        f"Analyze this student's attempt and explain what corrections are needed.\n\n"
         f"## Question\n{question}\n\n"
         f"## Student Code\n```python\n{student_code}\n```\n\n"
-        f"## Feedback\n{feedback_text}\n\n/no_think"
+        f"## Feedback\n{feedback_text}\n\n"
+        f"Analyze the student's attempt based on the feedback and identify where the student went wrong, and how they can fix it.\n\n/no_think"
     )
     reasoning_messages = [{"role": "user", "content": reasoning_prompt}]
     reasoning_input_text = tokenizer.apply_chat_template(
@@ -130,7 +130,7 @@ def _generate_reasoning(
     with torch.no_grad():
         reasoning_output = model.generate(
             **reasoning_inputs,
-            max_new_tokens=512,
+            max_new_tokens=1024,
             do_sample=True, temperature=0.7, top_p=0.95,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
@@ -138,7 +138,7 @@ def _generate_reasoning(
     reasoning_ids = reasoning_output[0, reasoning_inputs.input_ids.shape[1]:]
     reasoning_text = tokenizer.decode(reasoning_ids, skip_special_tokens=True)
     del reasoning_output, reasoning_inputs
-    return reasoning_text
+    return reasoning_text.replace("<think>", "").replace("</think>", "").strip()
 
 
 def _compute_reasoning_in_response_logits(
@@ -150,7 +150,7 @@ def _compute_reasoning_in_response_logits(
     full_completion: str,
     reasoning_text: str,
     max_seq_length: int = 10240,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute student and teacher logits with reasoning in the assistant turn.
 
@@ -160,30 +160,35 @@ def _compute_reasoning_in_response_logits(
     the combined reasoning + completion which contains multiple </think> tags).
 
     Returns:
-        (student_logits, teacher_logits): each (completion_len, vocab_size)
+        (student_logits, teacher_logits, completion_token_ids)
     """
     # Build student sequence (bypass template for assistant content)
     student_user_text = tokenizer.apply_chat_template(
         [{"role": "user", "content": question}],
         tokenize=False, add_generation_prompt=True)
-    student_full_text = student_user_text + completion
+    student_full_text = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": completion}
+        ],
+        tokenize=False, add_generation_prompt=False)
 
     # Build teacher sequence (bypass template for assistant content)
     teacher_context = (
         f"## Question\n{question}\n\n"
         f"## Previous Attempt (including reasoning)\n{full_completion}\n\n"
         f"## Feedback (from environment) for the previous attempt\n{feedback_text}\n\n"
-        f"Use the context above to inform your approach, but treat your attempt "
-        f"as an attempt from scratch. Do not reference the previous attempt in "
-        f"your solution, just use it and its feedback as guidance. Write a correct "
-        f"solution to the question. Put your code in a "
-        f"```python{{code}}``` block."
+        "Correctly solve the original question."
     )
     teacher_user_text = tokenizer.apply_chat_template(
         [{"role": "user", "content": teacher_context}],
         tokenize=False, add_generation_prompt=True)
-    teacher_full_text = teacher_user_text + reasoning_text + "\n\n" + completion
-    teacher_prefix_text = teacher_user_text + reasoning_text + "\n\n"
+    teacher_full_text = build_teacher_messages_ablation(
+        prompt=question, completion=completion,
+        feedback=feedback_text, attempt_mode="reasoning_in_response_thinking",
+        reasoning_text=reasoning_text,
+    )
+    teacher_prefix_text = teacher_user_text + reasoning_text
 
     # Tokenize
     student_enc = tokenizer(
@@ -200,21 +205,26 @@ def _compute_reasoning_in_response_logits(
         teacher_prefix_text, truncation=True, max_length=max_seq_length,
         padding=False).input_ids)
 
+    # Completion token IDs (from student side, raw tokenization)
+    s_seq_len = student_enc.input_ids.shape[1]
+    comp_ids = student_enc.input_ids[0, student_prompt_len:s_seq_len]
+
     # Forward passes and extract completion logits
     with torch.no_grad():
         student_out = model(**student_enc)
-        s_seq_len = student_enc.input_ids.shape[1]
-        student_logits = student_out.logits[0, student_prompt_len - 1: s_seq_len - 1, :]
+        student_logits = student_out.logits[0,
+                                            student_prompt_len - 1: s_seq_len - 1, :]
         del student_out
 
         teacher_out = model(**teacher_enc)
         t_seq_len = teacher_enc.input_ids.shape[1]
-        teacher_logits = teacher_out.logits[0, teacher_prefix_len - 1: t_seq_len - 1, :]
+        teacher_logits = teacher_out.logits[0,
+                                            teacher_prefix_len - 1: t_seq_len - 1, :]
         del teacher_out
 
     del student_enc, teacher_enc
 
-    return student_logits, teacher_logits
+    return student_logits, teacher_logits, comp_ids
 
 
 def compute_ablation_kls(
@@ -245,9 +255,21 @@ def compute_ablation_kls(
     Returns dict mapping attempt_mode -> {kl, ventiles, seq_len}.
     """
     student_msgs = [{"role": "user", "content": question}]
-    student_logits, _ = get_completion_logits(
+    student_logits, prompt_len = get_completion_logits(
         model, tokenizer, student_msgs, completion,
     )
+
+    # Get completion token IDs (for disagreement computation)
+    # These come from the template-processed student sequence.
+    student_full_msgs = student_msgs + \
+        [{"role": "assistant", "content": completion}]
+    student_full_text = tokenizer.apply_chat_template(
+        student_full_msgs, tokenize=False, add_generation_prompt=False)
+    full_ids = tokenizer(
+        student_full_text, truncation=True, max_length=max_seq_length, padding=False,
+    ).input_ids
+    template_comp_ids = torch.tensor(
+        full_ids[prompt_len:], device=student_logits.device)
 
     kl_fn = compute_full_kl_per_position if full_dist else compute_topk_kl_per_position
 
@@ -263,10 +285,11 @@ def compute_ablation_kls(
         if mode == "reasoning_in_response_thinking":
             # Reasoning goes in assistant turn — must bypass apply_chat_template
             # for both sides to keep completion tokens aligned.
-            s_logits, teacher_logits = _compute_reasoning_in_response_logits(
+            s_logits, teacher_logits, raw_comp_ids = _compute_reasoning_in_response_logits(
                 model, tokenizer, question, completion, feedback_text,
                 full_completion, reasoning_text, max_seq_length,
             )
+            comp_ids = raw_comp_ids
         else:
             teacher_full = build_teacher_messages_ablation(
                 prompt=question, completion=completion,
@@ -280,18 +303,38 @@ def compute_ablation_kls(
                 model, tokenizer, teacher_msgs, completion,
             )
             s_logits = student_logits
+            comp_ids = template_comp_ids
 
         if full_dist:
             kl = kl_fn(s_logits, teacher_logits, temperature)
         else:
             kl = kl_fn(s_logits, teacher_logits, top_k, temperature)
 
+        # Compute disagreement rate: fraction of tokens where teacher assigns
+        # lower probability than the student to the actual completion token.
         min_len = len(kl)
+        if min_len > 0:
+            token_len = min(min_len, len(comp_ids))
+            s_log_probs = F.log_softmax(s_logits[:token_len], dim=-1)
+            t_log_probs = F.log_softmax(teacher_logits[:token_len], dim=-1)
+            idx = torch.arange(token_len, device=s_logits.device)
+            token_ids = comp_ids[:token_len]
+            logp_diff = t_log_probs[idx, token_ids] - \
+                s_log_probs[idx, token_ids]
+            disagreement = (logp_diff < 0).float()
+            dis_ventiles = bin_into_ventiles(disagreement.detach().cpu())
+            mean_dis = disagreement.mean().item()
+        else:
+            dis_ventiles = [float("nan")] * 20
+            mean_dis = float("nan")
+
         results[mode] = {
             "kl": kl.detach().cpu(),
             "ventiles": bin_into_ventiles(kl.detach().cpu()),
+            "disagreement_ventiles": dis_ventiles,
             "seq_len": min_len,
             "mean_kl": kl.mean().item() if min_len > 0 else float("nan"),
+            "mean_disagreement": mean_dis,
         }
 
     return results
@@ -309,7 +352,8 @@ def aggregate_ventiles(
     stderrs = []
     for i in range(20):
         vals = [d[i] for d in ventile_lists]
-        var = sum((v - means[i]) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
+        var = sum((v - means[i]) ** 2 for v in vals) / \
+            (n - 1) if n > 1 else 0.0
         stderrs.append(math.sqrt(var / n) if n > 0 else 0.0)
     return means, stderrs
 
@@ -354,7 +398,8 @@ def run_experiment_2_5(
     print("Experiment 2.5: Teacher Prompt Ablation — KL Distribution")
     print("=" * 70)
     print(f"Model: {model_name}")
-    print(f"Problems: {num_problems} | Rollouts: {num_rollouts} | KL mode: {kl_mode}")
+    print(
+        f"Problems: {num_problems} | Rollouts: {num_rollouts} | KL mode: {kl_mode}")
     print(f"Conditions: {', '.join(ATTEMPT_MODES)}")
     print("=" * 70)
     print()
@@ -369,7 +414,8 @@ def run_experiment_2_5(
     model = model.cuda()
     model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -430,12 +476,13 @@ def run_experiment_2_5(
                 full_dist=full_dist,
             )
 
-            # Log mean KLs
+            # Log mean KLs and disagreement
             kl_summary = " | ".join(
-                f"{mode}: {kl_results[mode]['mean_kl']:.4f}"
+                f"{mode}: KL={kl_results[mode]['mean_kl']:.4f} "
+                f"dis={kl_results[mode]['mean_disagreement']:.1%}"
                 for mode in ATTEMPT_MODES
             )
-            print(f"    Mean KL: {kl_summary}")
+            print(f"    {kl_summary}")
 
             record = {
                 "problem_idx": prob_idx,
@@ -446,8 +493,16 @@ def run_experiment_2_5(
                     mode: kl_results[mode]["ventiles"]
                     for mode in ATTEMPT_MODES
                 },
+                "disagreement_ventiles": {
+                    mode: kl_results[mode]["disagreement_ventiles"]
+                    for mode in ATTEMPT_MODES
+                },
                 "mean_kl": {
                     mode: kl_results[mode]["mean_kl"]
+                    for mode in ATTEMPT_MODES
+                },
+                "mean_disagreement": {
+                    mode: kl_results[mode]["mean_disagreement"]
                     for mode in ATTEMPT_MODES
                 },
                 "seq_len": kl_results["code_only"]["seq_len"],
@@ -481,11 +536,18 @@ def run_experiment_2_5(
 
         mode_means = {}
         mode_stderrs = {}
+        dis_mode_means = {}
+        dis_mode_stderrs = {}
         for mode in ATTEMPT_MODES:
             ventile_lists = [r["ventiles"][mode] for r in records]
             means, stderrs = aggregate_ventiles(ventile_lists)
             mode_means[mode] = means
             mode_stderrs[mode] = stderrs
+
+            dis_lists = [r["disagreement_ventiles"][mode] for r in records]
+            d_means, d_stderrs = aggregate_ventiles(dis_lists)
+            dis_mode_means[mode] = d_means
+            dis_mode_stderrs[mode] = d_stderrs
 
         summary[stratum_name] = {
             "count": len(records),
@@ -496,35 +558,50 @@ def run_experiment_2_5(
                     "grand_mean_kl": sum(
                         r["mean_kl"][mode] for r in records
                     ) / len(records),
+                    "mean_disagreement_per_ventile": dis_mode_means[mode],
+                    "stderr_disagreement_per_ventile": dis_mode_stderrs[mode],
+                    "grand_mean_disagreement": sum(
+                        r["mean_disagreement"][mode] for r in records
+                    ) / len(records),
                 }
                 for mode in ATTEMPT_MODES
             },
         }
 
         print_comparison_table(
-            f"SUMMARY — {stratum_name}",
+            f"KL — {stratum_name}",
             mode_means, mode_stderrs, len(records),
+        )
+        print_comparison_table(
+            f"Disagreement Rate — {stratum_name}",
+            dis_mode_means, dis_mode_stderrs, len(records),
         )
     print("=" * 70)
 
     # ------------------------------------------------------------------
-    # Print slope analysis: compare first-half vs second-half KL
+    # Print slope analysis: compare first-half vs second-half
     # ------------------------------------------------------------------
-    print("\nSlope Analysis (second-half mean KL - first-half mean KL):")
-    print(f"{'Stratum':<15} {'Mode':<18} {'First Half':<12} {'Second Half':<12} {'Slope':<10}")
-    print("-" * 67)
-    for stratum_name, data in summary.items():
-        if data.get("count", 0) == 0:
-            continue
-        for mode in ATTEMPT_MODES:
-            ventiles = data["per_mode"][mode]["mean_kl_per_ventile"]
-            first_half = sum(ventiles[:10]) / 10
-            second_half = sum(ventiles[10:]) / 10
-            slope = second_half - first_half
-            print(
-                f"{stratum_name:<15} {mode:<18} {first_half:<12.4f} "
-                f"{second_half:<12.4f} {slope:<10.4f}"
-            )
+    for metric, key in [("KL", "mean_kl_per_ventile"),
+                        ("Disagreement", "mean_disagreement_per_ventile")]:
+        print(
+            f"\nSlope Analysis — {metric} (second-half mean - first-half mean):")
+        print(
+            f"{'Stratum':<15} {'Mode':<30} {'First Half':<12} {'Second Half':<12} {'Slope':<10}")
+        print("-" * 79)
+        for stratum_name, data in summary.items():
+            if data.get("count", 0) == 0:
+                continue
+            for mode in ATTEMPT_MODES:
+                ventiles = data["per_mode"][mode][key]
+                first_half = sum(ventiles[:10]) / 10
+                second_half = sum(ventiles[10:]) / 10
+                slope = second_half - first_half
+                fmt = ".4f" if metric == "KL" else ".1%"
+                print(
+                    f"{stratum_name:<15} {mode:<30} "
+                    f"{first_half:<12{fmt}} {second_half:<12{fmt}} "
+                    f"{slope:<10{fmt}}"
+                )
 
     # ------------------------------------------------------------------
     # Save results
@@ -574,7 +651,8 @@ def run_experiment_2_5(
                 means = data["per_mode"][mode]["mean_kl_per_ventile"]
                 stderrs = data["per_mode"][mode]["stderr_kl_per_ventile"]
 
-                axes[row][col].bar(x, means, yerr=stderrs, capsize=2, alpha=0.8)
+                axes[row][col].bar(x, means, yerr=stderrs,
+                                   capsize=2, alpha=0.8)
                 axes[row][col].set_xticks(x)
                 axes[row][col].set_xticklabels(
                     ventile_labels, rotation=45, ha="right", fontsize=7,
@@ -611,17 +689,50 @@ def run_experiment_2_5(
                     color=colors[mode], capsize=2, marker="o", markersize=3,
                 )
             ax.set_xticks(x)
-            ax.set_xticklabels(ventile_labels, rotation=45, ha="right", fontsize=7)
-            ax.set_title(f"KL by Teacher Prompt — {stratum_name} (n={data['count']})")
+            ax.set_xticklabels(ventile_labels, rotation=45,
+                               ha="right", fontsize=7)
+            ax.set_title(
+                f"KL by Teacher Prompt — {stratum_name} (n={data['count']})")
             ax.set_ylabel("KL(student || teacher)")
             ax.set_xlabel("Position ventile")
             ax.legend()
 
         plt.tight_layout()
-        overlay_path = os.path.join(output_dir, f"experiment_2_5_overlay{suffix}.png")
+        overlay_path = os.path.join(
+            output_dir, f"experiment_2_5_overlay{suffix}.png")
         plt.savefig(overlay_path, dpi=150)
         plt.close()
         print(f"Overlay plot saved to: {overlay_path}")
+
+        # Overlay plot: disagreement rate by teacher prompt, per stratum
+        fig3, axes3 = plt.subplots(
+            1, num_rows, figsize=(8 * num_rows, 5), squeeze=False,
+        )
+
+        for col, (stratum_name, data) in enumerate(plot_strata.items()):
+            ax = axes3[0][col]
+            for mode in ATTEMPT_MODES:
+                means = data["per_mode"][mode]["mean_disagreement_per_ventile"]
+                stderrs = data["per_mode"][mode]["stderr_disagreement_per_ventile"]
+                ax.errorbar(
+                    x, means, yerr=stderrs, label=mode,
+                    color=colors[mode], capsize=2, marker="o", markersize=3,
+                )
+            ax.set_xticks(x)
+            ax.set_xticklabels(ventile_labels, rotation=45,
+                               ha="right", fontsize=7)
+            ax.set_title(
+                f"Disagreement Rate by Teacher Prompt — {stratum_name} (n={data['count']})")
+            ax.set_ylabel("Disagreement rate")
+            ax.set_xlabel("Position ventile")
+            ax.legend()
+
+        plt.tight_layout()
+        dis_overlay_path = os.path.join(
+            output_dir, f"experiment_2_5_disagreement_overlay{suffix}.png")
+        plt.savefig(dis_overlay_path, dpi=150)
+        plt.close()
+        print(f"Disagreement overlay plot saved to: {dis_overlay_path}")
 
     except ImportError:
         print("matplotlib not available, skipping plots")

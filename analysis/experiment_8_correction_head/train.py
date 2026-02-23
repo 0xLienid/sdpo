@@ -180,97 +180,123 @@ def grpo_loss_for_problem(
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """GRPO loss for one problem.
 
-    Forward pass all rollouts, greedy decode + execute, then compute
-    advantage-weighted policy gradient with KL regularization.
+    Batched forward pass through correction head and lm_head for all rollouts,
+    then per-rollout greedy decode + execute (inherently sequential), then
+    batched advantage-weighted loss and KL regularization.
     """
     if len(rollouts) < 2:
         return None, {}
 
     device = rollouts[0].hidden_states.device
+    num_rollouts = len(rollouts)
 
-    # Phase 1: Forward, decode, execute all rollouts
-    token_log_probs = []   # per-rollout tensors (active_len,) with grad
+    # Phase 1: Batched forward pass through correction head + lm_head
+    seq_lens = [r.hidden_states.shape[0] for r in rollouts]
+    max_len = max(seq_lens)
+    hidden_dim = rollouts[0].hidden_states.shape[-1]
+    top_k = rollouts[0].topk_indices.shape[-1]
+
+    # Pad hidden states and topk indices to (num_rollouts, max_len, ...)
+    padded_hidden = torch.zeros(
+        num_rollouts, max_len, hidden_dim, device=device, dtype=rollouts[0].hidden_states.dtype)
+    padded_topk_idx = torch.zeros(
+        num_rollouts, max_len, top_k, device=device, dtype=torch.long)
+    seq_mask = torch.zeros(num_rollouts, max_len, device=device)
+
+    for i, r in enumerate(rollouts):
+        sl = seq_lens[i]
+        padded_hidden[i, :sl] = r.hidden_states
+        padded_topk_idx[i, :sl] = r.topk_indices
+        seq_mask[i, :sl] = 1.0
+
+    # Batched correction head forward — (num_rollouts, max_len, hidden_dim)
+    corrections = correction_head(padded_hidden)
+    corrected_hidden = padded_hidden + corrections
+
+    # Batched lm_head — (num_rollouts, max_len, vocab)
+    corrected_logits = lm_head(corrected_hidden)
+
+    # Batched gather for top-k logits — (num_rollouts, max_len, top_k)
+    topk_logits = corrected_logits.gather(-1, padded_topk_idx).float()
+    log_probs = F.log_softmax(topk_logits, dim=-1)
+
+    # Original (uncorrected) top-k for KL — no grad needed
+    with torch.no_grad():
+        orig_topk = lm_head(padded_hidden).gather(-1, padded_topk_idx).float()
+        orig_log_probs = F.log_softmax(orig_topk, dim=-1)
+
+    # Phase 2: Per-rollout greedy decode + execute (sequential, requires execution)
     rewards = []
-    kl_terms = []
-    norms = []
+    token_log_probs = []  # per-rollout (active_len,) with grad
 
-    for rollout in rollouts:
-        hidden = rollout.hidden_states
-        topk_idx = rollout.topk_indices
-        seq_len = hidden.shape[0]
+    for i in range(num_rollouts):
+        sl = seq_lens[i]
+        r_topk_logits = topk_logits[i, :sl]  # (sl, top_k) — has grad
+        r_log_probs = log_probs[i, :sl]
 
-        corrections = correction_head(hidden.unsqueeze(0)).squeeze(0)
-        corrected_hidden = hidden + corrections
-        corrected_logits = lm_head(corrected_hidden)
-        topk_logits = corrected_logits.gather(1, topk_idx).float()
-        log_probs = F.log_softmax(topk_logits, dim=-1)  # (L, K)
-
-        # Greedy decode within top-k
-        greedy_k = topk_logits.argmax(dim=-1)
-        greedy_vocab = topk_idx[torch.arange(seq_len, device=device), greedy_k]
+        greedy_k = r_topk_logits.argmax(dim=-1)
+        greedy_vocab = rollouts[i].topk_indices[
+            torch.arange(sl, device=device), greedy_k]
 
         # Truncate at EOS
         eos_id = tokenizer.eos_token_id
-        active_len = seq_len
+        active_len = sl
         if eos_id is not None:
             eos_mask = greedy_vocab == eos_id
             if eos_mask.any():
                 active_len = eos_mask.nonzero(as_tuple=True)[0][0].item()
 
         if active_len > 0:
-            tok_lp = log_probs[:active_len][
+            tok_lp = r_log_probs[:active_len][
                 torch.arange(active_len, device=device),
                 greedy_k[:active_len],
             ]
         else:
             tok_lp = None
 
-        # Execute
         token_ids = greedy_vocab[:active_len].tolist()
         text = tokenizer.decode(token_ids, skip_special_tokens=True)
         try:
             fb = get_environment_feedback(
-                prompt=rollout.question, completion=text,
-                example=rollout.example,
+                prompt=rollouts[i].question, completion=text,
+                example=rollouts[i].example,
             )
             r = compute_reward(fb)
         except Exception:
             r = 0.0
 
-        # KL(corrected || original_teacher) over full sequence
-        with torch.no_grad():
-            orig_topk = lm_head(hidden).gather(1, topk_idx).float()
-            orig_log_probs = F.log_softmax(orig_topk, dim=-1)
-        kl = (log_probs.exp() * (log_probs - orig_log_probs)).sum(-1).mean()
-
         token_log_probs.append(tok_lp)
         rewards.append(r)
-        kl_terms.append(kl)
-        norms.append(corrections.detach().norm(dim=-1).mean().item())
 
-    # Phase 2: Advantages
+    # Batched KL(corrected || original) with mask
+    kl_per_pos = (log_probs.exp() * (log_probs - orig_log_probs)).sum(-1)  # (num_rollouts, max_len)
+    kl_per_rollout = (kl_per_pos * seq_mask).sum(-1) / seq_mask.sum(-1).clamp(min=1)
+    mean_kl = kl_per_rollout.mean()
+
+    # Correction norm (detached)
+    mean_norm = corrections.detach().norm(dim=-1).mean().item()
+
+    # Phase 3: Advantages
     rewards_t = torch.tensor(rewards, device=device, dtype=torch.float32)
     std = rewards_t.std()
     has_variance = std > 1e-8
     if has_variance:
         advantages = (rewards_t - rewards_t.mean()) / (std + 1e-8)
     else:
-        advantages = torch.zeros(len(rewards), device=device)
+        advantages = torch.zeros(num_rollouts, device=device)
 
-    # Phase 3: Loss
+    # Phase 4: Loss
     surrogate_terms = []
     for i, tok_lp in enumerate(token_log_probs):
         if tok_lp is None:
             continue
-        # ratio = pi / pi.detach() — value is 1.0, grads flow through numerator
         ratio = (tok_lp - tok_lp.detach()).exp()
-        surrogate_terms.append((ratio * advantages[i]).mean())  # 1/|o_i|
+        surrogate_terms.append((ratio * advantages[i]).mean())
 
     if not surrogate_terms:
         return None, {}
 
-    mean_surr = torch.stack(surrogate_terms).mean()  # 1/G
-    mean_kl = torch.stack(kl_terms).mean()
+    mean_surr = torch.stack(surrogate_terms).mean()
     loss = -mean_surr + kl_coeff * mean_kl
 
     return loss, {
@@ -278,7 +304,7 @@ def grpo_loss_for_problem(
         "kl": mean_kl.item(),
         "mean_reward": rewards_t.mean().item(),
         "reward_std": std.item(),
-        "correction_norm": sum(norms) / len(norms),
+        "correction_norm": mean_norm,
         "has_variance": has_variance,
     }
 

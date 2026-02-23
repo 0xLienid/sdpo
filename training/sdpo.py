@@ -335,49 +335,47 @@ def compute_sdpo_loss_batched(
     student_logits = student_outputs.logits  # (batch, seq_len, vocab)
     del student_outputs
 
-    # Immediately extract completion logits and top-K for each sequence
-    # This reduces memory from (batch, seq_len, vocab) to (batch, completion_len, top_k)
-    student_topk_list = []
-    top_k_indices_list = []
+    # Compute per-element completion lengths
     completion_lens = []
-
     for i in range(batch_size):
         student_seq_len = (
             student_encoding.attention_mask[i] == 1).sum().item()
         teacher_seq_len = (
             teacher_encoding.attention_mask[i] == 1).sum().item()
-        student_completion_len = student_seq_len - student_prompt_lens[i]
-        teacher_completion_len = teacher_seq_len - teacher_prompt_lens[i]
-        completion_len = min(student_completion_len, teacher_completion_len)
+        student_comp = student_seq_len - student_prompt_lens[i]
+        teacher_comp = teacher_seq_len - teacher_prompt_lens[i]
+        completion_lens.append(max(0, min(student_comp, teacher_comp)))
 
-        if completion_len <= 0:
-            completion_lens.append(0)
-            student_topk_list.append(None)
-            top_k_indices_list.append(None)
-            continue
+    max_comp_len = max(completion_lens) if completion_lens else 0
+    if max_comp_len == 0:
+        del student_logits
+        return torch.tensor(0.0, device=student_device, requires_grad=True), {
+            "loss": 0.0, "completion_tokens": 0, "kl_per_token": 0.0,
+        }
 
-        completion_lens.append(completion_len)
+    # Build completion mask — (batch, max_comp_len)
+    comp_mask = torch.zeros(batch_size, max_comp_len, device=student_device)
+    for i in range(batch_size):
+        if completion_lens[i] > 0:
+            comp_mask[i, :completion_lens[i]] = 1.0
 
-        # Extract completion logits for this sequence
-        start_pos = student_prompt_lens[i] - 1
-        student_logits_comp = student_logits[i,
-                                             start_pos:start_pos + completion_len, :]
-
-        # Apply temperature and get top-K
-        student_logits_scaled = student_logits_comp / hparams.temperature
-        if top_k > 0 and top_k < student_logits_scaled.shape[-1]:
-            _, top_k_indices = torch.topk(student_logits_scaled, top_k, dim=-1)
-            student_topk = torch.gather(
-                student_logits_scaled, -1, top_k_indices)
+    # Extract student completion logits — (batch, max_comp_len, vocab)
+    # Uses cat+stack so autograd flows through to the original logits
+    vocab_size = student_logits.shape[-1]
+    student_comp_list = []
+    for i in range(batch_size):
+        cl = completion_lens[i]
+        if cl > 0:
+            start = student_prompt_lens[i] - 1
+            comp = student_logits[i, start:start + cl]
+            if cl < max_comp_len:
+                comp = torch.cat(
+                    [comp, comp.new_zeros(max_comp_len - cl, vocab_size)], dim=0)
         else:
-            student_topk = student_logits_scaled
-            top_k_indices = None
-
-        student_topk_list.append(student_topk)
-        top_k_indices_list.append(top_k_indices)
-
-    # Free full student logits
-    del student_logits
+            comp = student_logits.new_zeros(max_comp_len, vocab_size)
+        student_comp_list.append(comp)
+    student_comp = torch.stack(student_comp_list)  # (batch, max_comp, vocab)
+    del student_logits, student_comp_list
 
     # Batched teacher forward pass
     with torch.no_grad():
@@ -385,59 +383,44 @@ def compute_sdpo_loss_batched(
         teacher_logits = teacher_outputs.logits
         del teacher_outputs
 
-        # Immediately extract and gather at student's top-K indices
-        teacher_topk_list = []
+        teacher_comp_list = []
         for i in range(batch_size):
-            if completion_lens[i] <= 0:
-                teacher_topk_list.append(None)
-                continue
-
-            start_pos = teacher_prompt_lens[i] - 1
-            teacher_logits_comp = teacher_logits[i,
-                                                 start_pos:start_pos + completion_lens[i], :]
-            teacher_logits_comp = teacher_logits_comp.to(student_device)
-            teacher_logits_scaled = teacher_logits_comp / hparams.temperature
-
-            if top_k_indices_list[i] is not None:
-                teacher_topk = torch.gather(
-                    teacher_logits_scaled, -1, top_k_indices_list[i])
+            cl = completion_lens[i]
+            if cl > 0:
+                start = teacher_prompt_lens[i] - 1
+                comp = teacher_logits[i, start:start + cl]
+                if cl < max_comp_len:
+                    comp = torch.cat(
+                        [comp, comp.new_zeros(max_comp_len - cl, vocab_size)], dim=0)
             else:
-                teacher_topk = teacher_logits_scaled
+                comp = teacher_logits.new_zeros(max_comp_len, vocab_size)
+            teacher_comp_list.append(comp)
+        teacher_comp = torch.stack(teacher_comp_list).to(student_device)
+        del teacher_logits, teacher_comp_list
 
-            teacher_topk_list.append(teacher_topk)
+    # Batched top-K KL loss
+    total_tokens = int(comp_mask.sum().item())
 
-        # Free full teacher logits
-        del teacher_logits
+    s_scaled = student_comp / hparams.temperature
+    t_scaled = teacher_comp / hparams.temperature
+    del student_comp, teacher_comp
 
-    # Compute loss on reduced tensors
-    total_loss = torch.tensor(0.0, device=student_device, requires_grad=True)
-    total_tokens = 0
-    total_kl = 0.0
-
-    for i in range(batch_size):
-        if completion_lens[i] <= 0:
-            continue
-
-        student_topk = student_topk_list[i]
-        teacher_topk = teacher_topk_list[i]
-
-        student_probs = F.softmax(student_topk, dim=-1)
-        student_log_probs = F.log_softmax(student_topk, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_topk, dim=-1)
-
-        kl_per_token = (student_probs * (student_log_probs -
-                        teacher_log_probs)).sum(dim=-1)
-        total_loss = total_loss + kl_per_token.sum()
-        total_tokens += completion_lens[i]
-        total_kl += kl_per_token.sum().item()
-
-    # Average over all tokens
-    if total_tokens > 0:
-        loss = total_loss / total_tokens
-        avg_kl = total_kl / total_tokens
+    if top_k > 0 and top_k < s_scaled.shape[-1]:
+        _, topk_idx = torch.topk(s_scaled, top_k, dim=-1)
+        s_topk = torch.gather(s_scaled, -1, topk_idx)
+        t_topk = torch.gather(t_scaled, -1, topk_idx)
     else:
-        loss = total_loss
-        avg_kl = 0.0
+        s_topk = s_scaled
+        t_topk = t_scaled
+    del s_scaled, t_scaled
+
+    s_probs = F.softmax(s_topk, dim=-1)
+    s_log_probs = F.log_softmax(s_topk, dim=-1)
+    t_log_probs = F.log_softmax(t_topk, dim=-1)
+    kl = (s_probs * (s_log_probs - t_log_probs)).sum(dim=-1)  # (batch, max_comp)
+
+    loss = (kl * comp_mask).sum() / comp_mask.sum()
+    avg_kl = (kl.detach() * comp_mask).sum().item() / total_tokens
 
     metrics = {
         "loss": loss.item(),
@@ -646,112 +629,97 @@ def compute_distill_on_regen_loss_batched(
     student_logits = student_outputs.logits
     del student_outputs
 
-    student_topk_list = []
-    top_k_indices_list = []
+    # Compute per-element completion lengths
     completion_lens = []
-
     for i in range(batch_size):
         if teacher_completion_lens[i] == 0:
             completion_lens.append(0)
-            student_topk_list.append(None)
-            top_k_indices_list.append(None)
             continue
-
         student_seq_len = (
             student_encoding.attention_mask[i] == 1).sum().item()
         teacher_seq_len = (
             teacher_encoding.attention_mask[i] == 1).sum().item()
-        student_completion_len = student_seq_len - student_prompt_lens[i]
-        teacher_completion_len = teacher_seq_len - teacher_prompt_lens[i]
-        completion_len = min(student_completion_len, teacher_completion_len)
+        student_comp = student_seq_len - student_prompt_lens[i]
+        teacher_comp = teacher_seq_len - teacher_prompt_lens[i]
+        completion_lens.append(max(0, min(student_comp, teacher_comp)))
 
-        if completion_len <= 0:
-            completion_lens.append(0)
-            student_topk_list.append(None)
-            top_k_indices_list.append(None)
-            continue
+    max_comp_len = max(completion_lens) if completion_lens else 0
+    if max_comp_len == 0:
+        del student_logits
+        return torch.tensor(0.0, device=student_device, requires_grad=True), {
+            "loss": 0.0, "completion_tokens": 0, "kl_per_token": 0.0,
+            "teacher_completion_len": sum(teacher_completion_lens) / batch_size if batch_size > 0 else 0,
+        }
 
-        completion_lens.append(completion_len)
+    # Build completion mask — (batch, max_comp_len)
+    comp_mask = torch.zeros(batch_size, max_comp_len, device=student_device)
+    for i in range(batch_size):
+        if completion_lens[i] > 0:
+            comp_mask[i, :completion_lens[i]] = 1.0
 
-        start_pos = student_prompt_lens[i] - 1
-        student_logits_comp = student_logits[i,
-                                             start_pos:start_pos + completion_len, :]
-        student_logits_scaled = student_logits_comp / hparams.temperature
-
-        if top_k > 0 and top_k < student_logits_scaled.shape[-1]:
-            _, top_k_indices = torch.topk(student_logits_scaled, top_k, dim=-1)
-            student_topk = torch.gather(
-                student_logits_scaled, -1, top_k_indices)
+    # Extract student completion logits — (batch, max_comp_len, vocab)
+    vocab_size = student_logits.shape[-1]
+    student_comp_list = []
+    for i in range(batch_size):
+        cl = completion_lens[i]
+        if cl > 0:
+            start = student_prompt_lens[i] - 1
+            comp = student_logits[i, start:start + cl]
+            if cl < max_comp_len:
+                comp = torch.cat(
+                    [comp, comp.new_zeros(max_comp_len - cl, vocab_size)], dim=0)
         else:
-            student_topk = student_logits_scaled
-            top_k_indices = None
+            comp = student_logits.new_zeros(max_comp_len, vocab_size)
+        student_comp_list.append(comp)
+    student_comp = torch.stack(student_comp_list)
+    del student_logits, student_comp_list
 
-        student_topk_list.append(student_topk)
-        top_k_indices_list.append(top_k_indices)
-
-    del student_logits
-
-    # === Step 6: Batched teacher forward pass, immediately extract and reduce ===
+    # === Step 6: Batched teacher forward pass ===
     with torch.no_grad():
         teacher_outputs = teacher_model(**teacher_encoding)
         teacher_logits = teacher_outputs.logits
         del teacher_outputs
 
-        teacher_topk_list = []
+        teacher_comp_list = []
         for i in range(batch_size):
-            if completion_lens[i] <= 0:
-                teacher_topk_list.append(None)
-                continue
-
-            start_pos = teacher_prompt_lens[i] - 1
-            teacher_logits_comp = teacher_logits[i,
-                                                 start_pos:start_pos + completion_lens[i], :]
-            teacher_logits_comp = teacher_logits_comp.to(student_device)
-            teacher_logits_scaled = teacher_logits_comp / hparams.temperature
-
-            if top_k_indices_list[i] is not None:
-                teacher_topk = torch.gather(
-                    teacher_logits_scaled, -1, top_k_indices_list[i])
+            cl = completion_lens[i]
+            if cl > 0:
+                start = teacher_prompt_lens[i] - 1
+                comp = teacher_logits[i, start:start + cl]
+                if cl < max_comp_len:
+                    comp = torch.cat(
+                        [comp, comp.new_zeros(max_comp_len - cl, vocab_size)], dim=0)
             else:
-                teacher_topk = teacher_logits_scaled
+                comp = teacher_logits.new_zeros(max_comp_len, vocab_size)
+            teacher_comp_list.append(comp)
+        teacher_comp = torch.stack(teacher_comp_list).to(student_device)
+        del teacher_logits, teacher_comp_list
 
-            teacher_topk_list.append(teacher_topk)
+    # === Step 7: Batched top-K KL loss ===
+    total_tokens = int(comp_mask.sum().item())
 
-        del teacher_logits
+    s_scaled = student_comp / hparams.temperature
+    t_scaled = teacher_comp / hparams.temperature
+    del student_comp, teacher_comp
 
-    # === Step 7: Compute loss on reduced tensors ===
-    total_loss = torch.tensor(0.0, device=student_device, requires_grad=True)
-    total_tokens = 0
-    total_kl = 0.0
-    total_teacher_completion_len = sum(teacher_completion_lens)
-
-    for i in range(batch_size):
-        if completion_lens[i] <= 0:
-            continue
-
-        student_topk = student_topk_list[i]
-        teacher_topk = teacher_topk_list[i]
-
-        student_probs = F.softmax(student_topk, dim=-1)
-        student_log_probs = F.log_softmax(student_topk, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_topk, dim=-1)
-
-        kl_per_token = (student_probs * (student_log_probs -
-                        teacher_log_probs)).sum(dim=-1)
-        total_loss = total_loss + kl_per_token.sum()
-        total_tokens += completion_lens[i]
-        total_kl += kl_per_token.sum().item()
-
-    # Average over all tokens
-    if total_tokens > 0:
-        loss = total_loss / total_tokens
-        avg_kl = total_kl / total_tokens
+    if top_k > 0 and top_k < s_scaled.shape[-1]:
+        _, topk_idx = torch.topk(s_scaled, top_k, dim=-1)
+        s_topk = torch.gather(s_scaled, -1, topk_idx)
+        t_topk = torch.gather(t_scaled, -1, topk_idx)
     else:
-        loss = total_loss
-        avg_kl = 0.0
+        s_topk = s_scaled
+        t_topk = t_scaled
+    del s_scaled, t_scaled
 
-    avg_teacher_len = total_teacher_completion_len / \
-        batch_size if batch_size > 0 else 0
+    s_probs = F.softmax(s_topk, dim=-1)
+    s_log_probs = F.log_softmax(s_topk, dim=-1)
+    t_log_probs = F.log_softmax(t_topk, dim=-1)
+    kl = (s_probs * (s_log_probs - t_log_probs)).sum(dim=-1)
+
+    loss = (kl * comp_mask).sum() / comp_mask.sum()
+    avg_kl = (kl.detach() * comp_mask).sum().item() / total_tokens
+
+    avg_teacher_len = sum(teacher_completion_lens) / batch_size if batch_size > 0 else 0
 
     metrics = {
         "loss": loss.item(),

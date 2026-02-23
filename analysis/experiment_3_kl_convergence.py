@@ -211,7 +211,7 @@ def sdpo_training_step(
     hparams: SDPOHparams,
 ) -> float:
     """
-    Perform one SDPO training step over all rollouts (gradient accumulation).
+    Perform one SDPO training step over all rollouts (batched).
 
     Uses a separate EMA teacher model (matching the real sdpo_train loop).
     After the optimizer step, updates the teacher via EMA.
@@ -219,30 +219,25 @@ def sdpo_training_step(
     model.train()
     optimizer.zero_grad()
 
-    total_loss = 0.0
-    n = len(rollout_data)
-
-    for item in rollout_data:
-        loss, _ = compute_sdpo_loss_batched(
-            student_model=model,
-            teacher_model=teacher.model,
-            tokenizer=tokenizer,
-            prompts=[item["question"]],
-            completions=[item["completion"]],
-            feedbacks=[item["feedback_text"]],
-            prior_solutions=[None],
-            hparams=hparams,
-            student_attempts=[item["student_code"]],
-        )
-        (loss / n).backward()
-        total_loss += loss.item()
+    loss, _ = compute_sdpo_loss_batched(
+        student_model=model,
+        teacher_model=teacher.model,
+        tokenizer=tokenizer,
+        prompts=[item["question"] for item in rollout_data],
+        completions=[item["completion"] for item in rollout_data],
+        feedbacks=[item["feedback_text"] for item in rollout_data],
+        prior_solutions=[None] * len(rollout_data),
+        hparams=hparams,
+        student_attempts=[item["student_code"] for item in rollout_data],
+    )
+    loss.backward()
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.max_grad_norm)
     optimizer.step()
 
     teacher.update(model)
 
-    return total_loss / n
+    return loss.item()
 
 
 def measure_rollouts(
