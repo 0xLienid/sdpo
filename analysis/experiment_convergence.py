@@ -23,10 +23,12 @@ import copy
 import json
 import logging
 import os
+import random
 from datetime import datetime
 from math import comb
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,8 +46,6 @@ from training.sdpo import (
     EMATeacher,
     SDPOHparams,
     build_student_messages,
-    build_teacher_messages,
-    compute_sdpo_loss_batched,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,15 +72,19 @@ def evaluate_pass_at_k(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     dataset: LiveCodeBenchDataset,
-    k: int = 8,
-    temperature: float = 1.0,
+    k: int = 4,
+    n: int = 16,
+    temperature: float = 0.8,
     max_new_tokens: int = 4096,
-) -> Tuple[float, List[Dict[str, Any]]]:
+) -> Tuple[float, float, List[Dict[str, Any]]]:
     """
     Evaluate pass@k using private test cases.
 
-    Returns (mean_pass_at_k, per_problem_details).
+    Returns (mean_pass_at_k, mean_sample_pass_rate, per_problem_details).
     """
+    if n < k:
+        raise ValueError(f"eval n must be >= k, got n={n}, k={k}")
+
     model.eval()
     gc_was_enabled = getattr(model, "is_gradient_checkpointing", False)
     if gc_was_enabled:
@@ -92,10 +96,10 @@ def evaluate_pass_at_k(
         example = dataset[idx]
         title = example.get("question_title", f"Problem {idx}")
 
-        # Generate k completions
+        # Generate n completions, then estimate pass@k.
         rollouts = livecodebench_rollout(
             model, tokenizer, example,
-            num_rollouts=k, temperature=temperature,
+            num_rollouts=n, temperature=temperature,
             max_new_tokens=max_new_tokens,
         )
 
@@ -112,9 +116,14 @@ def evaluate_pass_at_k(
                 correct += 1
 
         score = pass_at_k(len(rollouts), correct, k)
+        sample_pass_rate = correct / \
+            len(rollouts) if len(rollouts) > 0 else 0.0
         per_problem.append({
             "idx": idx, "title": title,
-            "correct": correct, "total": len(rollouts), "pass_at_k": score,
+            "correct": correct,
+            "total": len(rollouts),
+            "pass_at_k": score,
+            "sample_pass_rate": sample_pass_rate,
         })
 
     if gc_was_enabled:
@@ -123,7 +132,18 @@ def evaluate_pass_at_k(
 
     mean_score = sum(p["pass_at_k"] for p in per_problem) / \
         len(per_problem) if per_problem else 0.0
-    return mean_score, per_problem
+    mean_sample_rate = sum(p["sample_pass_rate"] for p in per_problem) / \
+        len(per_problem) if per_problem else 0.0
+    return mean_score, mean_sample_rate, per_problem
+
+
+def set_global_seed(seed: int) -> None:
+    """Set seeds for reproducible dataset sampling and decoding."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +251,7 @@ def _generate_reasoning_batched(
     student_codes: List[str],
     feedbacks: List[str],
     max_prompt_length: int,
-    teacher_device: torch.device,
-    reasoning_prompt_template: str = "analysis",
+    teacher_device: torch.device
 ) -> List[str]:
     """
     Batched reasoning generation using left-padded inputs.
@@ -242,21 +261,15 @@ def _generate_reasoning_batched(
     batch_size = len(prompts)
     formatted = []
     for i in range(batch_size):
-        if reasoning_prompt_template == "corrections":
-            rp = (
-                f"Analyze this student's attempt and explain what corrections are needed.\n\n"
-                f"## Question\n{prompts[i]}\n\n"
-                f"## Student Code\n```python\n{student_codes[i]}\n```\n\n"
-                f"## Feedback\n{feedbacks[i]}\n\n/no_think"
-            )
-        else:
-            rp = (
-                f"## Question\n{prompts[i]}\n\n"
-                f"## Student Code\n```python\n{student_codes[i]}\n```\n\n"
-                f"## Feedback\n{feedbacks[i]}\n\n"
-                "Analyze the student's attempt based on the feedback and identify "
-                "where the student went wrong, and how they can fix it.\n\n/no_think"
-            )
+        rp = (
+            f"## Question\n{prompts[i]}\n\n"
+            f"## Student Code\n```python\n{student_codes[i]}\n```\n\n"
+            f"## Feedback\n{feedbacks[i]}\n\n"
+            "Analyze the student's attempt based on the feedback. If the "
+            "student was correct simply say so. If the student's code was "
+            "incorrect identify where the student went wrong, and how they "
+            "can fix it.\n\n/no_think"
+        )
         formatted.append(tokenizer.apply_chat_template(
             [{"role": "user", "content": rp}],
             tokenize=False, add_generation_prompt=True))
@@ -272,19 +285,157 @@ def _generate_reasoning_batched(
     with torch.no_grad():
         outputs = model.generate(
             **encoding,
-            max_new_tokens=512,
+            max_new_tokens=1024,
             do_sample=True, temperature=0.7, top_p=0.95,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
 
-    input_len = encoding.input_ids.shape[1]
-    reasoning_texts = [
-        tokenizer.decode(outputs[i, input_len:], skip_special_tokens=True)
-        for i in range(batch_size)
-    ]
+    input_lens = encoding.attention_mask.sum(dim=1).tolist()
+    reasoning_texts = []
+    for i, in_len in enumerate(input_lens):
+        reasoning_ids = outputs[i, int(in_len):]
+        reasoning_texts.append(
+            tokenizer.decode(reasoning_ids, skip_special_tokens=True)
+            .replace("<think>", "")
+            .replace("</think>", "")
+            .strip()
+        )
     del outputs, encoding
     return reasoning_texts
+
+
+def _build_teacher_context_ablation_style(
+    prompt: str,
+    feedback: str,
+    attempt_text: Optional[str] = None,
+    attempt_is_full_completion: bool = False,
+    reasoning_text: Optional[str] = None,
+) -> str:
+    """Mirror teacher prompt structure used in experiment_2_5."""
+    parts = [f"## Question\n{prompt}"]
+
+    if attempt_text is not None:
+        if attempt_is_full_completion:
+            parts.append(f"## Previous Attempt (including reasoning)\n{attempt_text}")
+        else:
+            parts.append(f"## Previous Attempt\n```python\n{attempt_text}\n```")
+
+    parts.append(f"## Feedback (from environment) for the previous attempt\n{feedback}")
+
+    if reasoning_text is not None:
+        parts.append(
+            f"## Analysis of Previous Attempt and Guidance for Improvement\n{reasoning_text}"
+        )
+
+    parts.append("Correctly solve the original question.")
+    return "\n\n".join(parts)
+
+
+def compute_sdpo_loss_batched_ablation_style(
+    student_model: AutoModelForCausalLM,
+    teacher_model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompts: List[str],
+    completions: List[str],
+    feedbacks: List[str],
+    hparams: SDPOHparams,
+    student_attempts: Optional[List[Optional[str]]] = None,
+    attempt_is_full_completion: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Batched SDPO KL loss with teacher prompts matching experiment_2_5."""
+    batch_size = len(prompts)
+    device = next(student_model.parameters()).device
+    if batch_size == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            "loss": 0.0, "completion_tokens": 0, "kl_per_token": 0.0}
+
+    teacher_device = next(teacher_model.parameters()).device
+    max_seq_length = hparams.max_prompt_length + hparams.max_response_length
+    top_k = hparams.top_k_distillation
+    temperature = hparams.temperature
+
+    if student_attempts is None:
+        student_attempts = [None] * batch_size
+
+    student_fulls, teacher_fulls = [], []
+    student_prompt_lens, teacher_prompt_lens = [], []
+
+    for i in range(batch_size):
+        student_messages = build_student_messages(prompts[i], completions[i])
+        student_fulls.append(tokenizer.apply_chat_template(
+            student_messages, tokenize=False, add_generation_prompt=False))
+        student_prompt_only = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompts[i]}],
+            tokenize=False, add_generation_prompt=True)
+        student_prompt_lens.append(len(tokenizer(
+            student_prompt_only, truncation=True, max_length=max_seq_length,
+            padding=False).input_ids))
+
+        teacher_context = _build_teacher_context_ablation_style(
+            prompt=prompts[i],
+            feedback=feedbacks[i],
+            attempt_text=student_attempts[i],
+            attempt_is_full_completion=attempt_is_full_completion,
+        )
+        teacher_messages = [
+            {"role": "user", "content": teacher_context},
+            {"role": "assistant", "content": completions[i]},
+        ]
+        teacher_fulls.append(tokenizer.apply_chat_template(
+            teacher_messages, tokenize=False, add_generation_prompt=False))
+        teacher_prompt_only = tokenizer.apply_chat_template(
+            [teacher_messages[0]], tokenize=False, add_generation_prompt=True)
+        teacher_prompt_lens.append(len(tokenizer(
+            teacher_prompt_only, truncation=True, max_length=max_seq_length,
+            padding=False).input_ids))
+
+    orig_pad_side = tokenizer.padding_side
+    tokenizer.padding_side = "right"
+    student_encoding = tokenizer(
+        student_fulls, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=True).to(device)
+    teacher_encoding = tokenizer(
+        teacher_fulls, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=True).to(teacher_device)
+    tokenizer.padding_side = orig_pad_side
+
+    completion_lens = []
+    for i in range(batch_size):
+        s_seq = (student_encoding.attention_mask[i] == 1).sum().item()
+        t_seq = (teacher_encoding.attention_mask[i] == 1).sum().item()
+        completion_lens.append(max(0, min(
+            s_seq - student_prompt_lens[i],
+            t_seq - teacher_prompt_lens[i])))
+
+    max_comp_len = max(completion_lens) if any(c > 0 for c in completion_lens) else 1
+    total_tokens = sum(completion_lens)
+    if total_tokens == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            "loss": 0.0, "completion_tokens": 0, "kl_per_token": 0.0}
+
+    comp_mask = torch.zeros(batch_size, max_comp_len, device=device)
+    for i in range(batch_size):
+        comp_mask[i, :completion_lens[i]] = 1.0
+
+    student_outputs = student_model(**student_encoding)
+    student_comp = _extract_completion_logits(
+        student_outputs.logits, student_encoding.attention_mask,
+        student_prompt_lens, completion_lens, max_comp_len)
+    del student_outputs
+
+    with torch.no_grad():
+        teacher_outputs = teacher_model(**teacher_encoding)
+        teacher_comp = _extract_completion_logits(
+            teacher_outputs.logits, teacher_encoding.attention_mask,
+            teacher_prompt_lens, completion_lens, max_comp_len)
+        del teacher_outputs
+        teacher_comp = teacher_comp.to(device)
+
+    loss, avg_kl, total_tokens = _batched_topk_kl_loss(
+        student_comp, teacher_comp, comp_mask, top_k, temperature)
+
+    return loss, {"loss": loss.item(), "completion_tokens": total_tokens, "kl_per_token": avg_kl}
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +489,16 @@ def compute_entropy_weighted_loss(
             student_prompt_only, truncation=True, max_length=max_seq_length,
             padding=False).input_ids))
 
-        teacher_messages = build_teacher_messages(
-            prompts[i], completions[i], feedbacks[i], None, student_attempts[i])
+        teacher_context = _build_teacher_context_ablation_style(
+            prompt=prompts[i],
+            feedback=feedbacks[i],
+            attempt_text=student_attempts[i],
+            attempt_is_full_completion=False,
+        )
+        teacher_messages = [
+            {"role": "user", "content": teacher_context},
+            {"role": "assistant", "content": completions[i]},
+        ]
         teacher_fulls.append(tokenizer.apply_chat_template(
             teacher_messages, tokenize=False, add_generation_prompt=False))
 
@@ -445,7 +604,7 @@ def compute_reasoning_augmented_loss(
     prompts: List[str],
     completions: List[str],
     feedbacks: List[str],
-    student_codes: List[str],
+    student_attempts: List[str],
     hparams: SDPOHparams,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
@@ -467,48 +626,49 @@ def compute_reasoning_augmented_loss(
 
     # Step 1: Batched reasoning generation
     reasoning_texts = _generate_reasoning_batched(
-        teacher_model, tokenizer, prompts, student_codes, feedbacks,
-        hparams.max_prompt_length, teacher_device,
-        reasoning_prompt_template="analysis")
+        teacher_model, tokenizer, prompts, student_attempts, feedbacks,
+        hparams.max_prompt_length, teacher_device)
 
-    # Step 2: Build all sequences
+    # Step 2: Build all sequences.
+    # We bypass apply_chat_template for the assistant content to match the
+    # reasoning-in-response logic in experiment_2_5 and avoid </think> mangling.
     student_fulls, teacher_fulls = [], []
     student_prompt_lens, teacher_prefix_lens = [], []
 
     for i in range(batch_size):
-        teacher_context = (
-            f"## Question\n{prompts[i]}\n\n"
-            f"## Previous Attempt\n```python\n{student_codes[i]}\n```\n\n"
-            f"## Feedback (from environment) for the previous attempt\n{feedbacks[i]}\n\n"
-            "Correctly solve the original question."
+        teacher_context = _build_teacher_context_ablation_style(
+            prompt=prompts[i],
+            feedback=feedbacks[i],
+            attempt_text=student_attempts[i],
+            attempt_is_full_completion=True,
         )
-        teacher_msgs = [
-            {"role": "user", "content": teacher_context},
-            {"role": "assistant",
-                "content": f"{reasoning_texts[i]}\n\n{completions[i]}"},
-        ]
-        teacher_fulls.append(tokenizer.apply_chat_template(
-            teacher_msgs, tokenize=False, add_generation_prompt=False))
-
         teacher_user_text = tokenizer.apply_chat_template(
             [{"role": "user", "content": teacher_context}],
-            tokenize=False, add_generation_prompt=True)
-        teacher_prefix = teacher_user_text + reasoning_texts[i] + "\n\n"
+            tokenize=False, add_generation_prompt=True,
+        )
+        teacher_full_text = (
+            teacher_user_text + f"\n{reasoning_texts[i]}\n\n{completions[i]}\n<im_end>"
+        )
+        teacher_prefix_text = teacher_user_text + f"\n{reasoning_texts[i]}"
+        teacher_fulls.append(teacher_full_text)
         teacher_prefix_lens.append(len(tokenizer(
-            teacher_prefix, truncation=True, max_length=max_seq_length,
+            teacher_prefix_text, truncation=True, max_length=max_seq_length,
             padding=False).input_ids))
 
-        student_msgs = [
-            {"role": "user", "content": prompts[i]},
-            {"role": "assistant", "content": completions[i]},
-        ]
-        student_fulls.append(tokenizer.apply_chat_template(
-            student_msgs, tokenize=False, add_generation_prompt=False))
-        student_prompt_text = tokenizer.apply_chat_template(
+        student_user_text = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompts[i]}],
-            tokenize=False, add_generation_prompt=True)
+            tokenize=False, add_generation_prompt=True,
+        )
+        student_full_text = tokenizer.apply_chat_template(
+            [
+                {"role": "user", "content": prompts[i]},
+                {"role": "assistant", "content": completions[i]},
+            ],
+            tokenize=False, add_generation_prompt=False,
+        )
+        student_fulls.append(student_full_text)
         student_prompt_lens.append(len(tokenizer(
-            student_prompt_text, truncation=True, max_length=max_seq_length,
+            student_user_text, truncation=True, max_length=max_seq_length,
             padding=False).input_ids))
 
     # Step 3: Batch tokenize (right-padded)
@@ -601,8 +761,7 @@ def compute_reasoning_in_prompt_loss(
     # Step 1: Batched reasoning generation
     reasoning_texts = _generate_reasoning_batched(
         teacher_model, tokenizer, prompts, student_codes, feedbacks,
-        hparams.max_prompt_length, teacher_device,
-        reasoning_prompt_template="corrections")
+        hparams.max_prompt_length, teacher_device)
 
     # Step 2: Build all sequences
     student_fulls, teacher_fulls = [], []
@@ -611,20 +770,12 @@ def compute_reasoning_in_prompt_loss(
     for i in range(batch_size):
         attempt = (teacher_attempts[i]
                    if teacher_attempts else student_codes[i])
-        if attempt_is_full_completion:
-            attempt_section = f"## Previous Attempt (including reasoning)\n{attempt}"
-        else:
-            attempt_section = f"## Previous Attempt\n```python\n{attempt}\n```"
-
-        teacher_context = (
-            f"## Question\n{prompts[i]}\n\n"
-            f"{attempt_section}\n\n"
-            f"## Feedback (from environment) for the previous attempt\n{feedbacks[i]}\n\n"
-            f"## Analysis of Previous Attempt and Guidance for Improvement\n{reasoning_texts[i]}\n\n"
-            f"Use the context above to inform your approach, but treat your attempt "
-            f"as an attempt from scratch. Do not reference the previous attempt in "
-            f"your solution, just use it and its feedback as guidance. Write a correct "
-            f"solution to the question. Put your code in a ```python{{code}}``` block."
+        teacher_context = _build_teacher_context_ablation_style(
+            prompt=prompts[i],
+            feedback=feedbacks[i],
+            attempt_text=attempt,
+            attempt_is_full_completion=attempt_is_full_completion,
+            reasoning_text=reasoning_texts[i],
         )
         teacher_msgs = [
             {"role": "user", "content": teacher_context},
@@ -714,7 +865,9 @@ def run_condition(
     dataset: LiveCodeBenchDataset,
     num_rollouts: int = 4,
     num_epochs: int = 3,
-    eval_k: int = 8,
+    eval_k: int = 4,
+    eval_n: int = 16,
+    eval_temperature: float = 0.8,
     eval_interval: int = 5,
     learning_rate: float = 1e-6,
     max_new_tokens: int = 4096,
@@ -730,7 +883,7 @@ def run_condition(
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name, torch_dtype=torch.bfloat16, trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
     )
     model.gradient_checkpointing_enable()
     model = model.cuda()
@@ -750,7 +903,7 @@ def run_condition(
 
     # Hparams for loss computation — sequence lengths depend on condition
     # with_thinking: teacher prompt has full completion (~4096) + question/feedback
-    # reasoning_augmented: teacher response has reasoning (~512) + completion (~4096)
+    # reasoning_augmented: teacher response has reasoning (~1024) + completion (~4096)
     # reasoning_in_prompt: teacher prompt has question + code + feedback + reasoning
     # reasoning_in_prompt_thinking: teacher prompt has full completion + feedback + reasoning
     if condition == "with_thinking":
@@ -758,7 +911,7 @@ def run_condition(
         max_prompt = max_new_tokens + 2048
         max_response = max_new_tokens
     elif condition == "reasoning_augmented":
-        max_prompt = max_new_tokens  # question + code + feedback
+        max_prompt = max_new_tokens + 2048  # question + full completion + feedback
         max_response = max_new_tokens + 1024  # reasoning + completion
     elif condition == "reasoning_in_prompt":
         max_prompt = max_new_tokens + 1024  # question + code + feedback + reasoning
@@ -785,10 +938,19 @@ def run_condition(
 
     # Initial evaluation (step 0)
     print("  Evaluating at step 0...")
-    score, details = evaluate_pass_at_k(
-        model, tokenizer, dataset, k=eval_k, max_new_tokens=max_new_tokens)
-    curve.append({"step": 0, "pass_at_k": score, "loss": None})
-    print(f"  Step 0 | pass@{eval_k} = {score:.4f}")
+    score, sample_rate, details = evaluate_pass_at_k(
+        model, tokenizer, dataset, k=eval_k, n=eval_n,
+        temperature=eval_temperature, max_new_tokens=max_new_tokens)
+    curve.append({
+        "step": 0,
+        "pass_at_k": score,
+        "avg_pass_rate": sample_rate,
+        "loss": None
+    })
+    print(
+        f"  Step 0 | pass@{eval_k} (n={eval_n}) = {score:.4f} "
+        f"| avg_pass_rate={sample_rate:.4f}"
+    )
 
     for epoch in range(num_epochs):
         print(f"\n  Epoch {epoch + 1}/{num_epochs}")
@@ -830,25 +992,25 @@ def run_condition(
 
             # Build student_attempts based on condition
             if condition in ("code_only", "entropy_weighted",
-                             "reasoning_augmented", "reasoning_in_prompt"):
+                             "reasoning_in_prompt"):
                 student_attempts_list = student_codes_list
-            elif condition in ("with_thinking", "reasoning_in_prompt_thinking"):
+            elif condition in ("with_thinking", "reasoning_augmented", "reasoning_in_prompt_thinking"):
                 student_attempts_list = completions_list
             else:
                 raise ValueError(f"Unknown condition: {condition}")
 
             # Compute loss
             if condition in ("code_only", "with_thinking"):
-                loss, metrics = compute_sdpo_loss_batched(
+                loss, metrics = compute_sdpo_loss_batched_ablation_style(
                     student_model=model,
                     teacher_model=teacher.model,
                     tokenizer=tokenizer,
                     prompts=prompts_list,
                     completions=completions_list,
                     feedbacks=feedbacks_list,
-                    prior_solutions=[None] * len(prompts_list),
                     hparams=hparams,
                     student_attempts=student_attempts_list,
+                    attempt_is_full_completion=(condition == "with_thinking"),
                 )
             elif condition == "entropy_weighted":
                 loss, metrics = compute_entropy_weighted_loss(
@@ -869,7 +1031,7 @@ def run_condition(
                     prompts=prompts_list,
                     completions=completions_list,
                     feedbacks=feedbacks_list,
-                    student_codes=student_codes_list,
+                    student_attempts=student_attempts_list,
                     hparams=hparams,
                 )
             elif condition == "reasoning_in_prompt":
@@ -917,20 +1079,40 @@ def run_condition(
             # Periodic evaluation
             if global_step % eval_interval == 0:
                 print(f"  Evaluating at step {global_step}...")
-                score, details = evaluate_pass_at_k(
-                    model, tokenizer, dataset, k=eval_k, max_new_tokens=max_new_tokens)
+                score, sample_rate, details = evaluate_pass_at_k(
+                    model, tokenizer, dataset, k=eval_k, n=eval_n,
+                    temperature=eval_temperature, max_new_tokens=max_new_tokens)
                 curve.append(
-                    {"step": global_step, "pass_at_k": score, "loss": step_loss})
-                print(f"  Step {global_step} | pass@{eval_k} = {score:.4f}")
+                    {
+                        "step": global_step,
+                        "pass_at_k": score,
+                        "avg_pass_rate": sample_rate,
+                        "loss": step_loss
+                    }
+                )
+                print(
+                    f"  Step {global_step} | pass@{eval_k} (n={eval_n}) = {score:.4f} "
+                    f"| avg_pass_rate={sample_rate:.4f}"
+                )
 
     # Final evaluation if not already done
     if not curve or curve[-1]["step"] != global_step:
         print(f"  Final evaluation at step {global_step}...")
-        score, details = evaluate_pass_at_k(
-            model, tokenizer, dataset, k=eval_k, max_new_tokens=max_new_tokens)
+        score, sample_rate, details = evaluate_pass_at_k(
+            model, tokenizer, dataset, k=eval_k, n=eval_n,
+            temperature=eval_temperature, max_new_tokens=max_new_tokens)
         curve.append(
-            {"step": global_step, "pass_at_k": score, "loss": step_loss})
-        print(f"  Step {global_step} | pass@{eval_k} = {score:.4f}")
+            {
+                "step": global_step,
+                "pass_at_k": score,
+                "avg_pass_rate": sample_rate,
+                "loss": step_loss
+            }
+        )
+        print(
+            f"  Step {global_step} | pass@{eval_k} (n={eval_n}) = {score:.4f} "
+            f"| avg_pass_rate={sample_rate:.4f}"
+        )
 
     # Clean up
     del model, teacher, optimizer
@@ -949,14 +1131,19 @@ def run_experiment(
     num_problems: int = 15,
     num_rollouts: int = 4,
     num_epochs: int = 3,
-    eval_k: int = 8,
+    eval_k: int = 4,
+    eval_n: int = 16,
+    eval_temperature: float = 0.8,
     eval_interval: int = 5,
     learning_rate: float = 1e-6,
     max_new_tokens: int = 4096,
     top_k: int = 20,
     output_dir: str = "analysis/results",
+    seed: int = 42,
 ) -> Dict[str, Any]:
     """Run convergence experiment across multiple conditions."""
+
+    set_global_seed(seed)
 
     print("=" * 60)
     print("Convergence Speed Experiment")
@@ -964,7 +1151,11 @@ def run_experiment(
     print(f"Model: {model_name}")
     print(
         f"Problems: {num_problems} | Rollouts: {num_rollouts} | Epochs: {num_epochs}")
-    print(f"Eval: pass@{eval_k} every {eval_interval} steps")
+    print(
+        f"Eval: pass@{eval_k} with n={eval_n}, temp={eval_temperature} "
+        f"every {eval_interval} steps"
+    )
+    print(f"Seed: {seed}")
     print(f"Conditions: {conditions}")
     print("=" * 60)
 
@@ -982,6 +1173,8 @@ def run_experiment(
             num_rollouts=num_rollouts,
             num_epochs=num_epochs,
             eval_k=eval_k,
+            eval_n=eval_n,
+            eval_temperature=eval_temperature,
             eval_interval=eval_interval,
             learning_rate=learning_rate,
             max_new_tokens=max_new_tokens,
@@ -1023,9 +1216,12 @@ def run_experiment(
             "num_rollouts": num_rollouts,
             "num_epochs": num_epochs,
             "eval_k": eval_k,
+            "eval_n": eval_n,
+            "eval_temperature": eval_temperature,
             "eval_interval": eval_interval,
             "learning_rate": learning_rate,
             "top_k": top_k,
+            "seed": seed,
             "conditions": conditions,
             "timestamp": datetime.now().isoformat(),
         },
@@ -1084,12 +1280,15 @@ if __name__ == "__main__":
     parser.add_argument("--num-problems", type=int, default=15)
     parser.add_argument("--num-rollouts", type=int, default=4)
     parser.add_argument("--num-epochs", type=int, default=3)
-    parser.add_argument("--eval-k", type=int, default=8)
+    parser.add_argument("--eval-k", type=int, default=4)
+    parser.add_argument("--eval-n", type=int, default=16)
+    parser.add_argument("--eval-temperature", type=float, default=0.8)
     parser.add_argument("--eval-interval", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--output-dir", type=str, default="analysis/results")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -1101,9 +1300,12 @@ if __name__ == "__main__":
         num_rollouts=args.num_rollouts,
         num_epochs=args.num_epochs,
         eval_k=args.eval_k,
+        eval_n=args.eval_n,
+        eval_temperature=args.eval_temperature,
         eval_interval=args.eval_interval,
         learning_rate=args.learning_rate,
         max_new_tokens=args.max_new_tokens,
         top_k=args.top_k,
         output_dir=args.output_dir,
+        seed=args.seed,
     )

@@ -118,7 +118,7 @@ def _generate_reasoning(
         f"## Question\n{question}\n\n"
         f"## Student Code\n```python\n{student_code}\n```\n\n"
         f"## Feedback\n{feedback_text}\n\n"
-        f"Analyze the student's attempt based on the feedback and identify where the student went wrong, and how they can fix it.\n\n/no_think"
+        f"Analyze the student's attempt based on the feedback. If the student was correct simply say so. If the student's code was incorrect identify where the student went wrong, and how they can fix it.\n\n/no_think"
     )
     reasoning_messages = [{"role": "user", "content": reasoning_prompt}]
     reasoning_input_text = tokenizer.apply_chat_template(
@@ -183,12 +183,9 @@ def _compute_reasoning_in_response_logits(
     teacher_user_text = tokenizer.apply_chat_template(
         [{"role": "user", "content": teacher_context}],
         tokenize=False, add_generation_prompt=True)
-    teacher_full_text = build_teacher_messages_ablation(
-        prompt=question, completion=completion,
-        feedback=feedback_text, attempt_mode="reasoning_in_response_thinking",
-        reasoning_text=reasoning_text,
-    )
-    teacher_prefix_text = teacher_user_text + reasoning_text
+
+    teacher_full_text = teacher_user_text + f"\n{reasoning_text}\n\n{completion}\n<im_end>"
+    teacher_prefix_text = teacher_user_text + f"\n{reasoning_text}"
 
     # Tokenize
     student_enc = tokenizer(
