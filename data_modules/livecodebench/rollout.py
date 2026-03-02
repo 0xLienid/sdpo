@@ -139,7 +139,8 @@ def batch_rollout(
         prompts = []
         questions = []
         for example in batch_examples:
-            question = example.get("question_content", example.get("question", ""))
+            question = example.get(
+                "question_content", example.get("question", ""))
             questions.append(question)
             messages = [{"role": "user", "content": question}]
             prompt = tokenizer.apply_chat_template(
@@ -185,7 +186,8 @@ def batch_rollout(
                     first_pad = pad_mask.nonzero(as_tuple=True)[0][0].item()
                     completion_ids = completion_ids[:first_pad]
 
-            completion = tokenizer.decode(completion_ids, skip_special_tokens=True)
+            completion = tokenizer.decode(
+                completion_ids, skip_special_tokens=True)
 
             results.append(RolloutResult(
                 prompt=question,

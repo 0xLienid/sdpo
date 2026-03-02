@@ -1,23 +1,3 @@
-"""
-Experiment 2.5: Teacher Prompt Ablation — KL Distribution
-
-Compares KL(student || teacher) across sequence positions under six teacher
-prompt configurations:
-
-  1. code_only   — teacher sees question + extracted code + feedback (current SDPO)
-  2. no_attempt  — teacher sees question + feedback only (no prior attempt)
-  3. with_thinking — teacher sees question + full completion (thinking + code) + feedback
-  4. reasoning_augmented — teacher sees question + extracted code + feedback +
-     model-generated reasoning about corrections (via /no_think) in the user prompt
-  5. reasoning_augmented_thinking — same as 4, but with full completion instead of
-     extracted code as the previous attempt
-  6. reasoning_in_response_thinking — like 5, but the reasoning is placed in the
-     assistant turn (prepended to the completion) instead of the user prompt
-
-Tests whether including the student's prior attempt in the teacher prompt
-contributes to the positional KL degradation ("prefix corruption").
-"""
-
 import argparse
 import json
 import logging
@@ -35,7 +15,7 @@ from analysis.utils import (
     bin_into_ventiles,
     compute_full_kl_per_position,
     compute_topk_kl_per_position,
-    get_completion_logits,
+    get_standard_completion_logits_and_mask
 )
 from data_modules.livecodebench.code_execution import extract_python_code
 from data_modules.livecodebench.dataset import LiveCodeBenchDataset
@@ -184,7 +164,8 @@ def _compute_reasoning_in_response_logits(
         [{"role": "user", "content": teacher_context}],
         tokenize=False, add_generation_prompt=True)
 
-    teacher_full_text = teacher_user_text + f"\n{reasoning_text}\n\n{completion}\n<im_end>"
+    teacher_full_text = teacher_user_text + \
+        f"\n{reasoning_text}\n\n{completion}\n<im_end>"
     teacher_prefix_text = teacher_user_text + f"\n{reasoning_text}"
 
     # Tokenize
@@ -222,6 +203,59 @@ def _compute_reasoning_in_response_logits(
     del student_enc, teacher_enc
 
     return student_logits, teacher_logits, comp_ids
+
+
+def get_metrics(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    comp_ids: torch.Tensor,
+    mask: torch.Tensor,
+    k: int = 20,
+    disagreement_threshold: float = -0.5
+) -> Dict[str, Any]:
+    """
+    Compute metrics for a given student logits, teacher logits, and completion token IDs. We then accumulate these metrics 
+    over ventiles
+
+    We are calculating the following metrics:
+    - KL(student || teacher) over the student's top-k tokens per position, averaged per ventile
+    - Disagreement rate, i.e. the fraction of tokens where the teacher assigns lower probability than the student to the actual completion token, averaged per ventile
+    - Student entropy, i.e. the entropy of the student's logits per position, averaged per ventile
+    - Teacher entropy, i.e. the entropy of the teacher's logits per position, averaged per ventile
+    """
+
+    student_top_k_logits, student_top_k_indices = torch.topk(
+        student_logits, k, dim=-1)
+    teacher_logits_at_top_k_indices = torch.gather(
+        teacher_logits, -1, student_top_k_indices)
+
+    per_token_kl = (student_top_k_logits * F.log_softmax(student_top_k_logits, dim=-1) -
+                    teacher_logits_at_top_k_indices * F.log_softmax(teacher_logits_at_top_k_indices, dim=-1)).sum(dim=-1)
+
+    s_log_probs = F.log_softmax(student_logits, dim=-1)
+    t_log_probs = F.log_softmax(teacher_logits, dim=-1)
+    token_ids = comp_ids
+    idx = torch.arange(student_logits.shape[0], device=s_log_probs.device)
+    logp_diff = t_log_probs[idx, token_ids] - s_log_probs[idx, token_ids]
+    disagreement = (logp_diff < disagreement_threshold).float()
+
+    student_entropy = -(F.softmax(student_top_k_logits, dim=-1)
+                        * F.log_softmax(student_top_k_logits, dim=-1)).sum(dim=-1)
+    teacher_entropy = -(F.softmax(teacher_logits_at_top_k_indices, dim=-1)
+                        * F.log_softmax(teacher_logits_at_top_k_indices, dim=-1)).sum(dim=-1)
+
+    per_token_kl = per_token_kl * mask
+    disagreement = disagreement * mask
+    student_entropy = student_entropy * mask
+    teacher_entropy = teacher_entropy * mask
+
+    return {
+        "kl_ventiles": bin_into_ventiles(per_token_kl.detach().cpu()),
+        "disagreement_ventiles": bin_into_ventiles(disagreement.detach().cpu()),
+        "student_entropy_ventiles": bin_into_ventiles(student_entropy.detach().cpu()),
+        "teacher_entropy_ventiles": bin_into_ventiles(teacher_entropy.detach().cpu()),
+        "seq_len": int(mask.sum(dim=-1).item()),
+    }
 
 
 def compute_ablation_kls(
@@ -422,7 +456,6 @@ def run_experiment_2_5(
     print(f"Loaded {len(dataset)} problems\n")
 
     # Collect per-rollout records
-    rollout_records: List[Dict[str, Any]] = []
     problem_results: List[Dict[str, Any]] = []
 
     for prob_idx in range(len(dataset)):
@@ -451,77 +484,44 @@ def run_experiment_2_5(
             feedbacks.append(fb)
             rewards.append(compute_reward(fb))
 
-        # Compute ablation KLs for each rollout
-        prob_rollout_records = []
-        for r_idx, (rollout, fb) in enumerate(zip(rollouts, feedbacks)):
-            student_code = extract_python_code(rollout.completion)
-            correct = rewards[r_idx] == 1.0
+        student_user_messages = [
+            f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{question}"] * num_rollouts
+        student_assistant_messages = [
+            rollout.completion for rollout in rollouts]
 
-            print(
-                f"  Rollout {r_idx}: reward={rewards[r_idx]:.2f} "
-                f"{'correct' if correct else 'incorrect'} — computing KL ({len(ATTEMPT_MODES)} conditions)..."
-            )
+        teacher_user_messages = [
+            f"## Question\n{question}\n\n## Previous Attempt\n{rollout.completion}\n\n## Feedback (from environment) for the previous attempt\n{fb.feedback_text}" for rollout, fb in zip(rollouts, feedbacks)]
+        teacher_assistant_messages = [
+            rollout.completion for rollout in rollouts]
 
-            kl_results = compute_ablation_kls(
-                model, tokenizer,
-                question=question,
-                completion=rollout.completion,
-                feedback_text=fb.feedback_text,
-                student_code=student_code,
-                full_completion=rollout.completion,
-                top_k=top_k,
-                full_dist=full_dist,
-            )
+        student_logits, student_mask = get_standard_completion_logits_and_mask(
+            model, tokenizer, student_user_messages, student_assistant_messages,
+        )
+        teacher_logits, teacher_mask = get_standard_completion_logits_and_mask(
+            model, tokenizer, teacher_user_messages, teacher_assistant_messages,
+        )
+        metrics = get_metrics(
+            student_logits, teacher_logits, student_mask, teacher_mask,
+        )
 
-            # Log mean KLs and disagreement
-            kl_summary = " | ".join(
-                f"{mode}: KL={kl_results[mode]['mean_kl']:.4f} "
-                f"dis={kl_results[mode]['mean_disagreement']:.1%}"
-                for mode in ATTEMPT_MODES
-            )
-            print(f"    {kl_summary}")
-
-            record = {
-                "problem_idx": prob_idx,
-                "rollout_idx": r_idx,
-                "reward": rewards[r_idx],
-                "correct": correct,
-                "ventiles": {
-                    mode: kl_results[mode]["ventiles"]
-                    for mode in ATTEMPT_MODES
-                },
-                "disagreement_ventiles": {
-                    mode: kl_results[mode]["disagreement_ventiles"]
-                    for mode in ATTEMPT_MODES
-                },
-                "mean_kl": {
-                    mode: kl_results[mode]["mean_kl"]
-                    for mode in ATTEMPT_MODES
-                },
-                "mean_disagreement": {
-                    mode: kl_results[mode]["mean_disagreement"]
-                    for mode in ATTEMPT_MODES
-                },
-                "seq_len": kl_results["code_only"]["seq_len"],
-            }
-            rollout_records.append(record)
-            prob_rollout_records.append(record)
-
-        problem_results.append({
+        problem_results.extend([{
             "problem_idx": prob_idx,
-            "question_title": title,
-            "mean_reward": sum(rewards) / len(rewards),
-            "rollouts": prob_rollout_records,
-        })
-        print()
+            "rollout_idx": r_idx,
+            "correct": rewards[r_idx] == 1.0,
+            "kl_ventiles": metrics["kl_ventiles"][r_idx],
+            "disagreement_ventiles": metrics["disagreement_ventiles"][r_idx],
+            "student_entropy_ventiles": metrics["student_entropy_ventiles"][r_idx],
+            "teacher_entropy_ventiles": metrics["teacher_entropy_ventiles"][r_idx],
+            "seq_len": metrics["seq_len"][r_idx],
+        } for r_idx in range(num_rollouts)])
 
     # ------------------------------------------------------------------
     # Aggregate by correctness strata
     # ------------------------------------------------------------------
     strata = {
-        "all": rollout_records,
-        "incorrect": [r for r in rollout_records if not r["correct"]],
-        "correct": [r for r in rollout_records if r["correct"]],
+        "all": problem_results,
+        "incorrect": [r for r in problem_results if not r["correct"]],
+        "correct": [r for r in problem_results if r["correct"]],
     }
 
     summary: Dict[str, Any] = {}
@@ -531,210 +531,53 @@ def run_experiment_2_5(
             summary[stratum_name] = {"count": 0}
             continue
 
-        mode_means = {}
-        mode_stderrs = {}
-        dis_mode_means = {}
-        dis_mode_stderrs = {}
-        for mode in ATTEMPT_MODES:
-            ventile_lists = [r["ventiles"][mode] for r in records]
-            means, stderrs = aggregate_ventiles(ventile_lists)
-            mode_means[mode] = means
-            mode_stderrs[mode] = stderrs
-
-            dis_lists = [r["disagreement_ventiles"][mode] for r in records]
-            d_means, d_stderrs = aggregate_ventiles(dis_lists)
-            dis_mode_means[mode] = d_means
-            dis_mode_stderrs[mode] = d_stderrs
+        kl_means, kl_stderrs = aggregate_ventiles(
+            [r["kl_ventiles"] for r in records])
+        disagreement_means, disagreement_stderrs = aggregate_ventiles(
+            [r["disagreement_ventiles"] for r in records])
+        student_entropy_means, student_entropy_stderrs = aggregate_ventiles(
+            [r["student_entropy_ventiles"] for r in records])
+        teacher_entropy_means, teacher_entropy_stderrs = aggregate_ventiles(
+            [r["teacher_entropy_ventiles"] for r in records])
+        seq_lens = [r["seq_len"] for r in records]
 
         summary[stratum_name] = {
             "count": len(records),
-            "per_mode": {
-                mode: {
-                    "mean_kl_per_ventile": mode_means[mode],
-                    "stderr_kl_per_ventile": mode_stderrs[mode],
-                    "grand_mean_kl": sum(
-                        r["mean_kl"][mode] for r in records
-                    ) / len(records),
-                    "mean_disagreement_per_ventile": dis_mode_means[mode],
-                    "stderr_disagreement_per_ventile": dis_mode_stderrs[mode],
-                    "grand_mean_disagreement": sum(
-                        r["mean_disagreement"][mode] for r in records
-                    ) / len(records),
-                }
-                for mode in ATTEMPT_MODES
-            },
+            "kl_means": kl_means,
+            "kl_stderrs": kl_stderrs,
+            "disagreement_means": disagreement_means,
+            "disagreement_stderrs": disagreement_stderrs,
+            "student_entropy_means": student_entropy_means,
+            "student_entropy_stderrs": student_entropy_stderrs,
+            "teacher_entropy_means": teacher_entropy_means,
+            "teacher_entropy_stderrs": teacher_entropy_stderrs,
+            "seq_lens": seq_lens,
         }
 
         print_comparison_table(
             f"KL — {stratum_name}",
-            mode_means, mode_stderrs, len(records),
+            kl_means, kl_stderrs, len(records),
         )
         print_comparison_table(
             f"Disagreement Rate — {stratum_name}",
-            dis_mode_means, dis_mode_stderrs, len(records),
+            disagreement_means, disagreement_stderrs, len(records),
         )
+        print_comparison_table(
+            f"Student Entropy — {stratum_name}",
+            student_entropy_means, student_entropy_stderrs, len(records),
+        )
+        print_comparison_table(
+            f"Teacher Entropy — {stratum_name}",
+            teacher_entropy_means, teacher_entropy_stderrs, len(records),
+        )
+        print_comparison_table(
+            f"Sequence Length — {stratum_name}",
+            seq_lens, len(records),
+        )
+
     print("=" * 70)
 
-    # ------------------------------------------------------------------
-    # Print slope analysis: compare first-half vs second-half
-    # ------------------------------------------------------------------
-    for metric, key in [("KL", "mean_kl_per_ventile"),
-                        ("Disagreement", "mean_disagreement_per_ventile")]:
-        print(
-            f"\nSlope Analysis — {metric} (second-half mean - first-half mean):")
-        print(
-            f"{'Stratum':<15} {'Mode':<30} {'First Half':<12} {'Second Half':<12} {'Slope':<10}")
-        print("-" * 79)
-        for stratum_name, data in summary.items():
-            if data.get("count", 0) == 0:
-                continue
-            for mode in ATTEMPT_MODES:
-                ventiles = data["per_mode"][mode][key]
-                first_half = sum(ventiles[:10]) / 10
-                second_half = sum(ventiles[10:]) / 10
-                slope = second_half - first_half
-                fmt = ".4f" if metric == "KL" else ".1%"
-                print(
-                    f"{stratum_name:<15} {mode:<30} "
-                    f"{first_half:<12{fmt}} {second_half:<12{fmt}} "
-                    f"{slope:<10{fmt}}"
-                )
-
-    # ------------------------------------------------------------------
-    # Save results
-    # ------------------------------------------------------------------
-    suffix = "_full_dist" if full_dist else ""
-    results = {
-        "config": {
-            "model_name": model_name,
-            "num_problems": num_problems,
-            "num_rollouts": num_rollouts,
-            "temperature": temperature,
-            "max_new_tokens": max_new_tokens,
-            "top_k": top_k,
-            "full_dist": full_dist,
-            "timestamp": datetime.now().isoformat(),
-        },
-        "problems": problem_results,
-        "summary": summary,
-    }
-
-    os.makedirs(output_dir, exist_ok=True)
-    json_path = os.path.join(output_dir, f"experiment_2_5{suffix}.json")
-    with open(json_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved to: {json_path}")
-
-    # ------------------------------------------------------------------
-    # Plot: one row per stratum, one column per attempt mode
-    # ------------------------------------------------------------------
-    try:
-        import matplotlib.pyplot as plt
-
-        plot_strata = {
-            k: v for k, v in summary.items() if v.get("count", 0) > 0
-        }
-        num_rows = len(plot_strata)
-        fig, axes = plt.subplots(
-            num_rows, len(ATTEMPT_MODES),
-            figsize=(7 * len(ATTEMPT_MODES), 5 * num_rows),
-            squeeze=False,
-        )
-        ventile_labels = [f"{d * 5}-{(d + 1) * 5}%" for d in range(20)]
-        x = range(20)
-
-        for row, (stratum_name, data) in enumerate(plot_strata.items()):
-            for col, mode in enumerate(ATTEMPT_MODES):
-                means = data["per_mode"][mode]["mean_kl_per_ventile"]
-                stderrs = data["per_mode"][mode]["stderr_kl_per_ventile"]
-
-                axes[row][col].bar(x, means, yerr=stderrs,
-                                   capsize=2, alpha=0.8)
-                axes[row][col].set_xticks(x)
-                axes[row][col].set_xticklabels(
-                    ventile_labels, rotation=45, ha="right", fontsize=7,
-                )
-                axes[row][col].set_title(
-                    f"{mode} — {stratum_name} (n={data['count']})"
-                )
-                axes[row][col].set_ylabel("KL(student || teacher)")
-
-        plt.tight_layout()
-        plot_path = os.path.join(output_dir, f"experiment_2_5{suffix}.png")
-        plt.savefig(plot_path, dpi=150)
-        plt.close()
-        print(f"Plot saved to: {plot_path}")
-
-        # Overlay plot: all modes on one axis, per stratum
-        fig2, axes2 = plt.subplots(
-            1, num_rows, figsize=(8 * num_rows, 5), squeeze=False,
-        )
-        colors = {
-            "code_only": "#2196F3", "no_attempt": "#4CAF50",
-            "with_thinking": "#FF5722", "reasoning_augmented": "#9C27B0",
-            "reasoning_augmented_thinking": "#FF9800",
-            "reasoning_in_response_thinking": "#795548",
-        }
-
-        for col, (stratum_name, data) in enumerate(plot_strata.items()):
-            ax = axes2[0][col]
-            for mode in ATTEMPT_MODES:
-                means = data["per_mode"][mode]["mean_kl_per_ventile"]
-                stderrs = data["per_mode"][mode]["stderr_kl_per_ventile"]
-                ax.errorbar(
-                    x, means, yerr=stderrs, label=mode,
-                    color=colors[mode], capsize=2, marker="o", markersize=3,
-                )
-            ax.set_xticks(x)
-            ax.set_xticklabels(ventile_labels, rotation=45,
-                               ha="right", fontsize=7)
-            ax.set_title(
-                f"KL by Teacher Prompt — {stratum_name} (n={data['count']})")
-            ax.set_ylabel("KL(student || teacher)")
-            ax.set_xlabel("Position ventile")
-            ax.legend()
-
-        plt.tight_layout()
-        overlay_path = os.path.join(
-            output_dir, f"experiment_2_5_overlay{suffix}.png")
-        plt.savefig(overlay_path, dpi=150)
-        plt.close()
-        print(f"Overlay plot saved to: {overlay_path}")
-
-        # Overlay plot: disagreement rate by teacher prompt, per stratum
-        fig3, axes3 = plt.subplots(
-            1, num_rows, figsize=(8 * num_rows, 5), squeeze=False,
-        )
-
-        for col, (stratum_name, data) in enumerate(plot_strata.items()):
-            ax = axes3[0][col]
-            for mode in ATTEMPT_MODES:
-                means = data["per_mode"][mode]["mean_disagreement_per_ventile"]
-                stderrs = data["per_mode"][mode]["stderr_disagreement_per_ventile"]
-                ax.errorbar(
-                    x, means, yerr=stderrs, label=mode,
-                    color=colors[mode], capsize=2, marker="o", markersize=3,
-                )
-            ax.set_xticks(x)
-            ax.set_xticklabels(ventile_labels, rotation=45,
-                               ha="right", fontsize=7)
-            ax.set_title(
-                f"Disagreement Rate by Teacher Prompt — {stratum_name} (n={data['count']})")
-            ax.set_ylabel("Disagreement rate")
-            ax.set_xlabel("Position ventile")
-            ax.legend()
-
-        plt.tight_layout()
-        dis_overlay_path = os.path.join(
-            output_dir, f"experiment_2_5_disagreement_overlay{suffix}.png")
-        plt.savefig(dis_overlay_path, dpi=150)
-        plt.close()
-        print(f"Disagreement overlay plot saved to: {dis_overlay_path}")
-
-    except ImportError:
-        print("matplotlib not available, skipping plots")
-
-    return results
+    return summary
 
 
 if __name__ == "__main__":

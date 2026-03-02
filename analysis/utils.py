@@ -7,53 +7,47 @@ from typing import Dict, List, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def get_completion_logits(
+def get_standard_completion_logits_and_mask(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    user_messages: List[Dict[str, str]],
-    completion: str,
+    user_messages: List[str],
+    assistant_messages: List[str],
     max_seq_length: int = 10240,
-) -> Tuple[torch.Tensor, int]:
-    """
-    Run a forward pass and return logits at each completion token position.
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    full_messages = [
+        [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": assistant_message},
+        ] for user_message, assistant_message in zip(user_messages, assistant_messages)
+    ]
+    prompt_lengths = [len(tokenizer(
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_message}],
+            tokenize=False, add_generation_prompt=True,
+        ), truncation=True, max_length=max_seq_length, padding=False,
+    ).input_ids) for user_message in user_messages]
 
-    Args:
-        user_messages: The user turn(s) of the conversation (no assistant turn).
-        completion: The assistant's response text.
-        max_seq_length: Max tokens for the full sequence.
-
-    Returns:
-        logits: (completion_len, vocab_size) logits predicting each completion token.
-        prompt_len: Number of prompt tokens.
-    """
-    full_messages = user_messages + \
-        [{"role": "assistant", "content": completion}]
-    full_text = tokenizer.apply_chat_template(
-        full_messages, tokenize=False, add_generation_prompt=False,
+    full_encodings = tokenizer.apply_chat_template(
+        full_messages, tokenize=True, return_tensors="pt", truncation=True,
+        max_length=max_seq_length, padding=True, return_in_dict=True
     )
-    prompt_text = tokenizer.apply_chat_template(
-        user_messages, tokenize=False, add_generation_prompt=True,
-    )
+    completion_lengths = full_encodings["attention_mask"].sum(
+        dim=-1) - prompt_lengths
 
-    full_encoding = tokenizer(
-        full_text, return_tensors="pt", truncation=True,
-        max_length=max_seq_length, padding=False,
-    ).to(model.device)
-
-    prompt_len = len(tokenizer(
-        prompt_text, truncation=True, max_length=max_seq_length, padding=False,
-    ).input_ids)
-
+    full_encodings = {k: v.to(model.device) for k, v in full_encodings.items()}
     with torch.no_grad():
-        outputs = model(**full_encoding)
+        outputs = model(**full_encodings)
 
-    seq_len = full_encoding.input_ids.shape[1]
+    logits = torch.zeros(
+        (outputs.logits.shape[0], max_seq_length, outputs.logits.shape[-1]))
+    assistant_mask = torch.zeros((outputs.logits.shape[0], max_seq_length))
+    for i in range(len(user_messages)):
+        logits[i, :completion_lengths[i], :] = outputs.logits[i,
+                                                              prompt_lengths[i]-1:outputs.logits.shape[1]-1, :]
+        assistant_mask[i, :completion_lengths[i]] = full_encodings["attention_mask"][i,
+                                                                                     prompt_lengths[i]-1:outputs.logits.shape[1]-1]
 
-    # Logits at position i predict token i+1.
-    # Logits at [prompt_len-1 .. seq_len-2] predict completion tokens [0 .. completion_len-1].
-    completion_logits = outputs.logits[0, prompt_len - 1: seq_len - 1, :]
-
-    return completion_logits, prompt_len
+    return logits, assistant_mask
 
 
 def compute_topk_kl_per_position(
@@ -127,18 +121,26 @@ def compute_full_kl_per_position(
     return kl_per_token
 
 
-def bin_into_ventiles(values: torch.Tensor) -> List[float]:
-    """Bin a 1-D tensor into 20 equal-width bins by relative position."""
-    n = len(values)
-    if n == 0:
-        return [float("nan")] * 20
+def bin_into_ventiles(values: torch.Tensor, mask: torch.Tensor) -> List[float]:
+    """Bin a 3-dimensional tensor into 20 equal-width bins by relative position across dimension 1."""
+    B, T = values.shape
+    device = values.device
+    dtype = values.dtype
 
-    ventile_means = []
-    for d in range(20):
-        start = int(d * n / 20)
-        end = int((d + 1) * n / 20)
-        if start < end:
-            ventile_means.append(values[start:end].mean().item())
-        else:
-            ventile_means.append(float("nan"))
-    return ventile_means
+    n = mask.sum(dim=1).to(torch.long)
+    n_safe = n.clamp_min(1)
+
+    pos = torch.arange(T, device=device, dtype=dtype)
+    valid = pos < n_safe.unsqueeze(1)
+
+    bins = ((pos * 20) // n_safe.unsqueeze(1)).clamp_max(19)
+
+    sums = torch.zeros((B, 20), device=device, dtype=dtype)
+    counts = torch.zeros((B, 20), device=device, dtype=dtype)
+
+    sums.scatter_add_(1, bins, values * valid.to(dtype))
+    counts.scatter_add_(1, bins, valid.to(dtype))
+
+    means = sums / counts.clamp_min(1)
+    means[counts == 0] = float("nan")
+    return means.detach().cpu().numpy().tolist()
