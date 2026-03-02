@@ -15,7 +15,7 @@ from analysis.utils import (
     bin_into_ventiles,
     compute_full_kl_per_position,
     compute_topk_kl_per_position,
-    get_standard_completion_logits_and_mask
+    get_standard_completion_logits_completion_ids_and_mask
 )
 from data_modules.livecodebench.code_execution import extract_python_code
 from data_modules.livecodebench.dataset import LiveCodeBenchDataset
@@ -211,7 +211,7 @@ def get_metrics(
     comp_ids: torch.Tensor,
     mask: torch.Tensor,
     k: int = 20,
-    disagreement_threshold: float = -0.5
+    disagreement_threshold: float = -1.0
 ) -> Dict[str, Any]:
     """
     Compute metrics for a given student logits, teacher logits, and completion token IDs. We then accumulate these metrics 
@@ -229,14 +229,18 @@ def get_metrics(
     teacher_logits_at_top_k_indices = torch.gather(
         teacher_logits, -1, student_top_k_indices)
 
-    per_token_kl = (student_top_k_logits * F.log_softmax(student_top_k_logits, dim=-1) -
-                    teacher_logits_at_top_k_indices * F.log_softmax(teacher_logits_at_top_k_indices, dim=-1)).sum(dim=-1)
+    s_probs = F.softmax(student_top_k_logits, dim=-1)
+    s_log_probs = F.log_softmax(student_top_k_logits, dim=-1)
+    t_log_probs = F.log_softmax(teacher_logits_at_top_k_indices, dim=-1)
+
+    per_token_kl = (s_probs * (s_log_probs - t_log_probs)).sum(dim=-1)
 
     s_log_probs = F.log_softmax(student_logits, dim=-1)
     t_log_probs = F.log_softmax(teacher_logits, dim=-1)
-    token_ids = comp_ids
-    idx = torch.arange(student_logits.shape[0], device=s_log_probs.device)
-    logp_diff = t_log_probs[idx, token_ids] - s_log_probs[idx, token_ids]
+    token_ids = comp_ids.to(torch.int64)
+    t_selected_log_probs = torch.gather(t_log_probs, -1, token_ids.unsqueeze(-1))
+    s_selected_log_probs = torch.gather(s_log_probs, -1, token_ids.unsqueeze(-1))
+    logp_diff = (t_selected_log_probs - s_selected_log_probs).squeeze(-1)
     disagreement = (logp_diff < disagreement_threshold).float()
 
     student_entropy = -(F.softmax(student_top_k_logits, dim=-1)
@@ -250,11 +254,11 @@ def get_metrics(
     teacher_entropy = teacher_entropy * mask
 
     return {
-        "kl_ventiles": bin_into_ventiles(per_token_kl.detach().cpu()),
-        "disagreement_ventiles": bin_into_ventiles(disagreement.detach().cpu()),
-        "student_entropy_ventiles": bin_into_ventiles(student_entropy.detach().cpu()),
-        "teacher_entropy_ventiles": bin_into_ventiles(teacher_entropy.detach().cpu()),
-        "seq_len": int(mask.sum(dim=-1).item()),
+        "kl_ventiles": bin_into_ventiles(per_token_kl.detach().cpu(), mask),
+        "disagreement_ventiles": bin_into_ventiles(disagreement.detach().cpu(), mask),
+        "student_entropy_ventiles": bin_into_ventiles(student_entropy.detach().cpu(), mask),
+        "teacher_entropy_ventiles": bin_into_ventiles(teacher_entropy.detach().cpu(), mask),
+        "seq_len": mask.sum(dim=-1).to(torch.int64),
     }
 
 
@@ -391,25 +395,34 @@ def aggregate_ventiles(
 
 def print_comparison_table(
     title: str,
-    mode_means: Dict[str, List[float]],
-    mode_stderrs: Dict[str, List[float]],
+    values: List[float],
     count: int,
+    stderrs: Optional[List[float]] = None,
 ) -> None:
-    """Print a formatted comparison table across attempt modes."""
+    """Print a formatted comparison table for a single metric series."""
     print(f"\n{title} (n={count})")
-    header = f"{'Ventile':<10}"
-    for mode in ATTEMPT_MODES:
-        header += f" {mode:<18}"
-    print(header)
-    print("-" * (10 + 19 * len(ATTEMPT_MODES)))
-    for d in range(20):
+    if stderrs is None:
+        if len(values) == 0:
+            print("No values available.")
+            return
+        mean = sum(values) / len(values)
+        var = sum((v - mean) ** 2 for v in values) / \
+            (len(values) - 1) if len(values) > 1 else 0.0
+        stderr = math.sqrt(var / len(values))
+        print(f"{'Mean':<10} {'StdErr':<10}")
+        print("-" * 22)
+        print(f"{mean:<10.4f} {stderr:<10.4f}")
+        return
+
+    if len(values) != len(stderrs):
+        raise ValueError(
+            f"values/stderrs length mismatch: {len(values)} vs {len(stderrs)}")
+
+    print(f"{'Ventile':<10} {'Mean±StdErr':<18}")
+    print("-" * 30)
+    for d, (mean, stderr) in enumerate(zip(values, stderrs)):
         pct = f"{d * 5}-{(d + 1) * 5}%"
-        row = f"{pct:<10}"
-        for mode in ATTEMPT_MODES:
-            m = mode_means[mode][d]
-            se = mode_stderrs[mode][d]
-            row += f" {m:>7.4f}±{se:<8.4f}"
-        print(row)
+        print(f"{pct:<10} {mean:>7.4f}±{stderr:<8.4f}")
 
 
 def run_experiment_2_5(
@@ -417,7 +430,7 @@ def run_experiment_2_5(
     num_problems: int = 10,
     num_rollouts: int = 4,
     temperature: float = 1.0,
-    max_new_tokens: int = 4096,
+    max_new_tokens: int = 8192,
     top_k: int = 20,
     full_dist: bool = False,
     output_dir: str = "analysis/results",
@@ -484,6 +497,10 @@ def run_experiment_2_5(
             feedbacks.append(fb)
             rewards.append(compute_reward(fb))
 
+            # if rewards[-1] == 0.0:
+            #     print(rollout.completion)
+            #     raise ValueError("Incorrect rollout")
+
         student_user_messages = [
             f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{question}"] * num_rollouts
         student_assistant_messages = [
@@ -494,14 +511,14 @@ def run_experiment_2_5(
         teacher_assistant_messages = [
             rollout.completion for rollout in rollouts]
 
-        student_logits, student_mask = get_standard_completion_logits_and_mask(
+        student_logits, student_completion_ids, student_mask = get_standard_completion_logits_completion_ids_and_mask(
             model, tokenizer, student_user_messages, student_assistant_messages,
         )
-        teacher_logits, teacher_mask = get_standard_completion_logits_and_mask(
+        teacher_logits, _, teacher_mask = get_standard_completion_logits_completion_ids_and_mask(
             model, tokenizer, teacher_user_messages, teacher_assistant_messages,
         )
         metrics = get_metrics(
-            student_logits, teacher_logits, student_mask, teacher_mask,
+            student_logits, teacher_logits, student_completion_ids, student_mask
         )
 
         problem_results.extend([{
@@ -556,19 +573,19 @@ def run_experiment_2_5(
 
         print_comparison_table(
             f"KL — {stratum_name}",
-            kl_means, kl_stderrs, len(records),
+            kl_means, len(records), kl_stderrs,
         )
         print_comparison_table(
             f"Disagreement Rate — {stratum_name}",
-            disagreement_means, disagreement_stderrs, len(records),
+            disagreement_means, len(records), disagreement_stderrs,
         )
         print_comparison_table(
             f"Student Entropy — {stratum_name}",
-            student_entropy_means, student_entropy_stderrs, len(records),
+            student_entropy_means, len(records), student_entropy_stderrs,
         )
         print_comparison_table(
             f"Teacher Entropy — {stratum_name}",
-            teacher_entropy_means, teacher_entropy_stderrs, len(records),
+            teacher_entropy_means, len(records), teacher_entropy_stderrs,
         )
         print_comparison_table(
             f"Sequence Length — {stratum_name}",
@@ -585,10 +602,10 @@ if __name__ == "__main__":
         description="Experiment 2.5: Teacher Prompt Ablation — KL Distribution"
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--num-problems", type=int, default=15)
+    parser.add_argument("--num-problems", type=int, default=5)
     parser.add_argument("--num-rollouts", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--max-new-tokens", type=int, default=8192)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--full-dist", action="store_true",
                         help="Use full vocabulary KL instead of top-K")

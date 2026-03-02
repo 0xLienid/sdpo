@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def get_standard_completion_logits_and_mask(
+def get_standard_completion_logits_completion_ids_and_mask(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     user_messages: List[str],
@@ -32,7 +32,7 @@ def get_standard_completion_logits_and_mask(
         max_length=max_seq_length, padding=True, return_in_dict=True
     )
     completion_lengths = full_encodings["attention_mask"].sum(
-        dim=-1) - prompt_lengths
+        dim=-1) - torch.tensor(prompt_lengths)
 
     full_encodings = {k: v.to(model.device) for k, v in full_encodings.items()}
     with torch.no_grad():
@@ -40,14 +40,18 @@ def get_standard_completion_logits_and_mask(
 
     logits = torch.zeros(
         (outputs.logits.shape[0], max_seq_length, outputs.logits.shape[-1]))
-    assistant_mask = torch.zeros((outputs.logits.shape[0], max_seq_length))
+    completion_ids = torch.zeros((outputs.logits.shape[0], max_seq_length), dtype=torch.int64)
+    assistant_mask = torch.zeros((outputs.logits.shape[0], max_seq_length), dtype=torch.bool)
     for i in range(len(user_messages)):
+        end_idx = prompt_lengths[i] + completion_lengths[i] - 1
         logits[i, :completion_lengths[i], :] = outputs.logits[i,
-                                                              prompt_lengths[i]-1:outputs.logits.shape[1]-1, :]
+                                                              prompt_lengths[i]-1:end_idx, :]
+        completion_ids[i, :completion_lengths[i]] = full_encodings["input_ids"][i,
+                                                                                 prompt_lengths[i]:end_idx+1].to(torch.int64)
         assistant_mask[i, :completion_lengths[i]] = full_encodings["attention_mask"][i,
-                                                                                     prompt_lengths[i]-1:outputs.logits.shape[1]-1]
+                                                                                     prompt_lengths[i]-1:end_idx]
 
-    return logits, assistant_mask
+    return logits, completion_ids, assistant_mask
 
 
 def compute_topk_kl_per_position(
@@ -133,9 +137,9 @@ def bin_into_ventiles(values: torch.Tensor, mask: torch.Tensor) -> List[float]:
     pos = torch.arange(T, device=device, dtype=dtype)
     valid = pos < n_safe.unsqueeze(1)
 
-    bins = ((pos * 20) // n_safe.unsqueeze(1)).clamp_max(19)
+    bins = ((pos * 20) // n_safe.unsqueeze(1)).clamp_max(19).to(torch.int64)
 
-    sums = torch.zeros((B, 20), device=device, dtype=dtype)
+    sums = torch.zeros((B, 20), device=device, dtype=torch.float32)
     counts = torch.zeros((B, 20), device=device, dtype=dtype)
 
     sums.scatter_add_(1, bins, values * valid.to(dtype))
