@@ -238,8 +238,10 @@ def get_metrics(
     s_log_probs = F.log_softmax(student_logits, dim=-1)
     t_log_probs = F.log_softmax(teacher_logits, dim=-1)
     token_ids = comp_ids.to(torch.int64)
-    t_selected_log_probs = torch.gather(t_log_probs, -1, token_ids.unsqueeze(-1))
-    s_selected_log_probs = torch.gather(s_log_probs, -1, token_ids.unsqueeze(-1))
+    t_selected_log_probs = torch.gather(
+        t_log_probs, -1, token_ids.unsqueeze(-1))
+    s_selected_log_probs = torch.gather(
+        s_log_probs, -1, token_ids.unsqueeze(-1))
     logp_diff = (t_selected_log_probs - s_selected_log_probs).squeeze(-1)
     disagreement = (logp_diff < disagreement_threshold).float()
 
@@ -507,7 +509,7 @@ def run_experiment_2_5(
             rollout.completion for rollout in rollouts]
 
         teacher_user_messages = [
-            f"## Question\n{question}\n\n## Previous Attempt\n{rollout.completion}\n\n## Feedback (from environment) for the previous attempt\n{fb.feedback_text}" for rollout, fb in zip(rollouts, feedbacks)]
+            f"## Question\n{question}\n\n## Previous Attempt\n{rollout.completion}\n\n## Feedback (from environment) for the previous attempt\n{fb.feedback_text}\nCorrectly solve the original question." for rollout, fb in zip(rollouts, feedbacks)]
         teacher_assistant_messages = [
             rollout.completion for rollout in rollouts]
 
