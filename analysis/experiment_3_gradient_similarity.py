@@ -128,6 +128,13 @@ def run_experiment_3(
             return float("nan")
         return sum(values) / len(values)
 
+    def pairwise_cosine_similarities(grads: List[torch.Tensor]) -> List[float]:
+        similarities: List[float] = []
+        for i in range(len(grads)):
+            for j in range(i + 1, len(grads)):
+                similarities.append(cosine_similarity(grads[i], grads[j]).item())
+        return similarities
+
     print("Loading model and tokenizer...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -161,7 +168,7 @@ def run_experiment_3(
             max_new_tokens=max_new_tokens,
         )
 
-        problem_results = []
+        rollout_records = []
         for r_idx, rollout in enumerate(rollouts):
             fb = get_environment_feedback(
                 prompt=rollout.prompt, completion=rollout.completion,
@@ -185,62 +192,82 @@ def run_experiment_3(
             last_75_grads = compute_gradient(
                 model, tokenizer, student_messages, teacher_messages, mode="last_75")
 
-            problem_results.append({
-                "problem_idx": prob_idx,
+            rollout_records.append({
                 "rollout_idx": r_idx,
                 "correct": reward == 1.0,
                 "first_25_grads": first_25_grads,
                 "last_75_grads": last_75_grads,
             })
 
-        results.extend(problem_results)
+        correct_records = [r for r in rollout_records if r["correct"]]
+        incorrect_records = [r for r in rollout_records if not r["correct"]]
 
-    strata = {
-        "all": results,
-        "incorrect": [r for r in results if not r["correct"]],
-        "correct": [r for r in results if r["correct"]],
-    }
+        all_similarities = {
+            "first_25": pairwise_cosine_similarities(
+                [r["first_25_grads"] for r in rollout_records]
+            ),
+            "last_75": pairwise_cosine_similarities(
+                [r["last_75_grads"] for r in rollout_records]
+            ),
+        }
+        correct_similarities = {
+            "first_25": pairwise_cosine_similarities(
+                [r["first_25_grads"] for r in correct_records]
+            ),
+            "last_75": pairwise_cosine_similarities(
+                [r["last_75_grads"] for r in correct_records]
+            ),
+        }
+        incorrect_similarities = {
+            "first_25": pairwise_cosine_similarities(
+                [r["first_25_grads"] for r in incorrect_records]
+            ),
+            "last_75": pairwise_cosine_similarities(
+                [r["last_75_grads"] for r in incorrect_records]
+            ),
+        }
+
+        results.append({
+            "problem_idx": prob_idx,
+            "all_similarities": all_similarities,
+            "correct_similarities": correct_similarities,
+            "incorrect_similarities": incorrect_similarities,
+        })
+
+        print(f"Problem {prob_idx} summary")
+        print(f"  Num correct: {len(correct_records)}/{len(rollout_records)}")
+        print(f"  all_similarities: {all_similarities}")
+        print(f"  correct_similarities: {correct_similarities}")
+        print(f"  incorrect_similarities: {incorrect_similarities}")
+        print()
 
     summary: Dict[str, Any] = {}
     print("=" * 70)
-    for stratum_name, records in strata.items():
-        if not records:
-            summary[stratum_name] = {"count": 0}
-            continue
+    for stratum_name in ["all_similarities", "correct_similarities", "incorrect_similarities"]:
+        first_25_problem_means = [
+            mean_or_nan(r[stratum_name]["first_25"])
+            for r in results
+            if r[stratum_name]["first_25"]
+        ]
+        last_75_problem_means = [
+            mean_or_nan(r[stratum_name]["last_75"])
+            for r in results
+            if r[stratum_name]["last_75"]
+        ]
 
-        first_25_grads = [r["first_25_grads"] for r in records]
-        last_75_grads = [r["last_75_grads"] for r in records]
-
-        first_25_cosine_similarities = []
-        last_75_cosine_similarities = []
-
-        # Compute pairwise cosine similarities of first_25_grads across every rollout pairing in the stratum
-        for i in range(len(first_25_grads)):
-            for j in range(i + 1, len(first_25_grads)):
-                first_25_cosine_similarities.append(
-                    cosine_similarity(first_25_grads[i], first_25_grads[j]).item())
-        mean_first_25_cosine_similarity = mean_or_nan(
-            first_25_cosine_similarities)
-
-        # Compute pairwise cosine similarities of last_75_grads across every rollout pairing in the stratum
-        for i in range(len(last_75_grads)):
-            for j in range(i + 1, len(last_75_grads)):
-                last_75_cosine_similarities.append(
-                    cosine_similarity(last_75_grads[i], last_75_grads[j]).item())
-        mean_last_75_cosine_similarity = mean_or_nan(
-            last_75_cosine_similarities)
+        mean_first_25_across_problems = mean_or_nan(first_25_problem_means)
+        mean_last_75_across_problems = mean_or_nan(last_75_problem_means)
 
         summary[stratum_name] = {
-            "count": len(records),
-            "mean_first_25_cosine_similarity": mean_first_25_cosine_similarity,
-            "mean_last_75_cosine_similarity": mean_last_75_cosine_similarity,
+            "num_problems_with_pairs_first_25": len(first_25_problem_means),
+            "num_problems_with_pairs_last_75": len(last_75_problem_means),
+            "mean_first_25_across_problems": mean_first_25_across_problems,
+            "mean_last_75_across_problems": mean_last_75_across_problems,
         }
 
-        print(f"SUMMARY — {stratum_name} (n={len(records)})")
-        print(
-            f"  Mean first 25 cosine similarity: {mean_first_25_cosine_similarity:.4f}")
-        print(
-            f"  Mean last 75 cosine similarity: {mean_last_75_cosine_similarity:.4f}")
+        print(f"SUMMARY — {stratum_name} (across problems)")
+        print(f"  Mean first 25 cosine similarity: {mean_first_25_across_problems:.4f}")
+        print(f"  Mean last 75 cosine similarity: {mean_last_75_across_problems:.4f}")
         print()
         print("=" * 70)
 
