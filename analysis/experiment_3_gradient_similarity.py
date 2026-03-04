@@ -16,7 +16,6 @@ def cosine_similarity(tensor1: torch.Tensor, tensor2: torch.Tensor) -> torch.Ten
 def compute_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
-    comp_ids: torch.Tensor,
     mask: torch.Tensor,
     k: int = 20
 ) -> torch.Tensor:
@@ -36,7 +35,6 @@ def compute_gradient(
     tokenizer: AutoTokenizer,
     student_messages: List[Dict[str, str]],
     teacher_messages: List[Dict[str, str]],
-    max_seq_length: int = 10240,
     top_k: int = 20,
     mode: str = "first_25",  # "first_25" or "last_75"
 ) -> torch.Tensor:
@@ -49,16 +47,16 @@ def compute_gradient(
     student_prompt_lengths = len(tokenizer.apply_chat_template(
         [{"role": "user", "content": student_messages[0]["content"]}],
         tokenize=True, add_generation_prompt=True,
-    ))
+    )["input_ids"])
     teacher_prompt_lengths = len(tokenizer.apply_chat_template(
         [{"role": "user", "content": teacher_messages[0]["content"]}],
         tokenize=True, add_generation_prompt=True,
-    ))
+    )["input_ids"])
 
     student_full = tokenizer.apply_chat_template(
-        student_messages, tokenize=True, add_generation_prompt=False, truncation=True, max_length=max_seq_length, padding=True, return_tensors="pt", return_in_dict=True)
+        student_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
     teacher_full = tokenizer.apply_chat_template(
-        teacher_messages, tokenize=True, add_generation_prompt=False, truncation=True, max_length=max_seq_length, padding=True, return_tensors="pt", return_in_dict=True)
+        teacher_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
     completion_lengths = student_full["attention_mask"].sum(
         dim=-1) - torch.tensor(student_prompt_lengths)
 
@@ -72,11 +70,21 @@ def compute_gradient(
         teacher_outputs = model(**teacher_full)
 
     end_idx = student_prompt_lengths + completion_lengths - 1
+    teacher_end_idx = teacher_prompt_lengths + completion_lengths - 1
     student_logits = outputs.logits[:, student_prompt_lengths-1:end_idx, :]
     teacher_logits = teacher_outputs.logits[:,
-                                            teacher_prompt_lengths-1:end_idx, :]
-    comp_ids = student_full["input_ids"][:,
-                                         student_prompt_lengths:end_idx+1].to(torch.int64)
+                                            teacher_prompt_lengths-1:teacher_end_idx, :]
+
+    with open("student_text_log.txt", "w") as f:
+        f.write(tokenizer.decode(
+            student_full["input_ids"][:, student_prompt_lengths-1:end_idx]))
+
+    with open("teacher_text_log.txt", "w") as f:
+        f.write(tokenizer.decode(
+            teacher_full["input_ids"][:, teacher_prompt_lengths-1:teacher_end_idx]))
+
+    raise ValueError("Stop here")
+
     mask = torch.zeros(
         (student_logits.shape[0], student_logits.shape[1]),
         dtype=torch.float32,
@@ -84,19 +92,17 @@ def compute_gradient(
     )
 
     if mode == "first_25":
-        mask_end_idx = student_prompt_lengths + (completion_lengths // 4) - 1
+        mask_end_idx = (completion_lengths // 4)
         mask[:, :mask_end_idx] = 1
     elif mode == "last_75":
-        mask_start_idx = student_prompt_lengths + \
-            (completion_lengths * 3 // 4) - 1
-        end_idx = student_prompt_lengths + completion_lengths - 1
-        mask[:, mask_start_idx:end_idx] = 1
+        mask_start_idx = (completion_lengths // 4)
+        mask[:, mask_start_idx:completion_lengths] = 1
     else:
         raise ValueError(f"Invalid mode: {mode}")
 
     optimizer.zero_grad()
     token_losses = compute_loss(
-        student_logits, teacher_logits, comp_ids, mask, top_k)
+        student_logits, teacher_logits, mask, top_k)
     loss = token_losses.sum() / mask.sum().clamp(min=1.0)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -132,7 +138,8 @@ def run_experiment_3(
         similarities: List[float] = []
         for i in range(len(grads)):
             for j in range(i + 1, len(grads)):
-                similarities.append(cosine_similarity(grads[i], grads[j]).item())
+                similarities.append(cosine_similarity(
+                    grads[i], grads[j]).item())
         return similarities
 
     print("Loading model and tokenizer...")
@@ -266,8 +273,10 @@ def run_experiment_3(
         }
 
         print(f"SUMMARY — {stratum_name} (across problems)")
-        print(f"  Mean first 25 cosine similarity: {mean_first_25_across_problems:.4f}")
-        print(f"  Mean last 75 cosine similarity: {mean_last_75_across_problems:.4f}")
+        print(
+            f"  Mean first 25 cosine similarity: {mean_first_25_across_problems:.4f}")
+        print(
+            f"  Mean last 75 cosine similarity: {mean_last_75_across_problems:.4f}")
         print()
         print("=" * 70)
 

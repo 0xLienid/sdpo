@@ -256,10 +256,10 @@ def get_metrics(
     teacher_entropy = teacher_entropy * mask
 
     return {
-        "kl_ventiles": bin_into_ventiles(per_token_kl.detach().cpu(), mask),
-        "disagreement_ventiles": bin_into_ventiles(disagreement.detach().cpu(), mask),
-        "student_entropy_ventiles": bin_into_ventiles(student_entropy.detach().cpu(), mask),
-        "teacher_entropy_ventiles": bin_into_ventiles(teacher_entropy.detach().cpu(), mask),
+        "kl_ventiles": bin_into_ventiles(per_token_kl.detach().cpu(), mask.detach().cpu()),
+        "disagreement_ventiles": bin_into_ventiles(disagreement.detach().cpu(), mask.detach().cpu()),
+        "student_entropy_ventiles": bin_into_ventiles(student_entropy.detach().cpu(), mask.detach().cpu()),
+        "teacher_entropy_ventiles": bin_into_ventiles(teacher_entropy.detach().cpu(), mask.detach().cpu()),
         "seq_len": mask.sum(dim=-1).to(torch.int64),
     }
 
