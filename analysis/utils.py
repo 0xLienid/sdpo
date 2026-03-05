@@ -12,7 +12,7 @@ def get_standard_completion_logits_completion_ids_and_mask(
     tokenizer: AutoTokenizer,
     user_messages: List[str],
     assistant_messages: List[str],
-    max_seq_length: int = 10240,
+    # max_seq_length: int = 10240,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     full_messages = [
         [
@@ -24,12 +24,11 @@ def get_standard_completion_logits_completion_ids_and_mask(
         tokenizer.apply_chat_template(
             [{"role": "user", "content": user_message}],
             tokenize=False, add_generation_prompt=True,
-        ), truncation=True, max_length=max_seq_length, padding=False,
+        )
     ).input_ids) for user_message in user_messages]
 
     full_encodings = tokenizer.apply_chat_template(
-        full_messages, tokenize=True, return_tensors="pt", truncation=True,
-        max_length=max_seq_length, padding=True, return_in_dict=True
+        full_messages, tokenize=True, return_tensors="pt", padding=True, return_in_dict=True
     )
     completion_lengths = full_encodings["attention_mask"].sum(
         dim=-1) - torch.tensor(prompt_lengths)
@@ -38,10 +37,11 @@ def get_standard_completion_logits_completion_ids_and_mask(
     with torch.no_grad():
         outputs = model(**full_encodings)
 
+    max_completion_length = completion_lengths.max().item()
     logits = torch.zeros(
-        (outputs.logits.shape[0], max_seq_length, outputs.logits.shape[-1]))
-    completion_ids = torch.zeros((outputs.logits.shape[0], max_seq_length), dtype=torch.int64)
-    assistant_mask = torch.zeros((outputs.logits.shape[0], max_seq_length), dtype=torch.bool)
+        (outputs.logits.shape[0], max_completion_length, outputs.logits.shape[-1]), device=model.device)
+    completion_ids = torch.zeros((outputs.logits.shape[0], max_completion_length), dtype=torch.int64, device=model.device)
+    assistant_mask = torch.zeros((outputs.logits.shape[0], max_completion_length), dtype=torch.bool, device=model.device)
     for i in range(len(user_messages)):
         end_idx = prompt_lengths[i] + completion_lengths[i] - 1
         logits[i, :completion_lengths[i], :] = outputs.logits[i,

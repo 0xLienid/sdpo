@@ -40,22 +40,22 @@ def run_training_loop(
     top_k: int = 20,
     num_iterations: int = 5
 ) -> List[Dict[str, Any]]:
-    initial_rollouts = livecodebench_rollout(
-        model, tokenizer, example,
-        num_rollouts=num_rollouts,
-        temperature=temperature,
-        max_new_tokens=max_new_tokens,
-    )
-    initial_feedbacks = [get_environment_feedback(
-        prompt=rollout.prompt, completion=rollout.completion,
-        example=example,
-    ) for rollout in initial_rollouts]
-    rollout_reward = sum([compute_reward(feedback)
-                         for feedback in initial_feedbacks])
+    # initial_rollouts = livecodebench_rollout(
+    #     model, tokenizer, example,
+    #     num_rollouts=num_rollouts,
+    #     temperature=temperature,
+    #     max_new_tokens=max_new_tokens,
+    # )
+    # initial_feedbacks = [get_environment_feedback(
+    #     prompt=rollout.prompt, completion=rollout.completion,
+    #     example=example,
+    # ) for rollout in initial_rollouts]
+    # rollout_reward = sum([compute_reward(feedback)
+    #                      for feedback in initial_feedbacks])
 
-    if rollout_reward > 0.0:
-        print("Initial rollouts were successful, skipping training loop")
-        return []
+    # if rollout_reward > 0.0:
+    #     print("Initial rollouts were successful, skipping training loop")
+    #     return []
 
     print(
         f"Running training loop for problem {example['question_title']} for {num_iterations} iterations")
@@ -78,7 +78,7 @@ def run_training_loop(
             num_rollouts=1,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
-        )
+        )[0]
 
         feedback = get_environment_feedback(
             prompt=rollout.prompt, completion=rollout.completion,
@@ -108,9 +108,10 @@ def run_training_loop(
             student_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
         teacher_full = tokenizer.apply_chat_template(
             teacher_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
-        completion_length = len(
-            student_full["input_ids"]) - student_prompt_lengths
-        print(student_prompt_lengths, completion_length)
+        completion_length = student_full["input_ids"].shape[1] - student_prompt_lengths
+        print(student_full["input_ids"].shape)
+        print(teacher_full["input_ids"].shape)
+        print(student_prompt_lengths, teacher_prompt_lengths, completion_length)
 
         student_full = {k: v.to(model.device) for k, v in student_full.items()}
         outputs = model(**student_full)
@@ -124,17 +125,19 @@ def run_training_loop(
                                         1:student_prompt_lengths + completion_length - 1, :]
         teacher_logits = teacher_outputs.logits[:, teacher_prompt_lengths -
                                                 1:teacher_prompt_lengths + completion_length - 1, :]
+        completion_ids = student_full["input_ids"][:, student_prompt_lengths:student_prompt_lengths + completion_length]
         mask = torch.ones(1, completion_length, device=model.device)
 
         optimizer.zero_grad()
-        loss = compute_loss(
+        token_losses = compute_loss(
             student_logits, teacher_logits, mask, top_k)
+        loss = token_losses.sum() / mask.sum().clamp(min=1.0)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         metrics = get_metrics(
-            student_logits, teacher_logits, mask, top_k)
+            student_logits, teacher_logits, completion_ids, mask, top_k)
         results.append({
             "iteration": iteration,
             "correct": reward == 1.0,
@@ -185,7 +188,7 @@ def run_experiment_4(
     print(f"Loaded {len(dataset)} problems\n")
 
     results = []
-    for prob_idx in range(len(dataset)):
+    for prob_idx in range(3, len(dataset)):
         example = dataset[prob_idx]
         title = example["question_title"]
         question = example["question_content"]
@@ -199,8 +202,14 @@ def run_experiment_4(
             top_k=top_k,
             num_iterations=num_iterations,
         )
-        print(metrics)
-        raise ValueError("Stop here")
+
+        if metrics != []:
+            results.append({
+                "problem_idx": prob_idx,
+                "title": title,
+                "question": question,
+                "metrics": metrics,
+            })
 
     return results
 
@@ -208,7 +217,7 @@ def run_experiment_4(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--num_problems", type=int, default=10)
+    parser.add_argument("--num_problems", type=int, default=15)
     parser.add_argument("--num_rollouts", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=8192)

@@ -205,6 +205,21 @@ def _compute_reasoning_in_response_logits(
     return student_logits, teacher_logits, comp_ids
 
 
+def _pad_seq_dim(x: torch.Tensor, target_len: int, pad_value: float = 0.0) -> torch.Tensor:
+    pad_t = target_len - x.shape[1]
+
+    if pad_t <= 0:
+        return x
+
+    if x.dim() == 3:
+        return F.pad(x, (0, 0, 0, pad_t), value=pad_value)
+    
+    if x.dim() == 2:
+        return F.pad(x, (0, pad_t), value=pad_value)
+    
+    raise ValueError(f"Unsupported dimension: {x.dim()}")
+
+
 def get_metrics(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -223,6 +238,11 @@ def get_metrics(
     - Student entropy, i.e. the entropy of the student's logits per position, averaged per ventile
     - Teacher entropy, i.e. the entropy of the teacher's logits per position, averaged per ventile
     """
+    target_len = max(student_logits.shape[1], teacher_logits.shape[1], comp_ids.shape[1], mask.shape[1])
+    student_logits = _pad_seq_dim(student_logits, target_len)
+    teacher_logits = _pad_seq_dim(teacher_logits, target_len)
+    comp_ids = _pad_seq_dim(comp_ids, target_len)
+    mask = _pad_seq_dim(mask, target_len, pad_value=False)
 
     student_top_k_logits, student_top_k_indices = torch.topk(
         student_logits, k, dim=-1)
@@ -519,6 +539,7 @@ def run_experiment_2_5(
         teacher_logits, _, teacher_mask = get_standard_completion_logits_completion_ids_and_mask(
             model, tokenizer, teacher_user_messages, teacher_assistant_messages,
         )
+
         metrics = get_metrics(
             student_logits, teacher_logits, student_completion_ids, student_mask
         )
@@ -604,10 +625,10 @@ if __name__ == "__main__":
         description="Experiment 2.5: Teacher Prompt Ablation — KL Distribution"
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--num-problems", type=int, default=5)
+    parser.add_argument("--num-problems", type=int, default=15)
     parser.add_argument("--num-rollouts", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--max-new-tokens", type=int, default=8192)
+    parser.add_argument("--max-new-tokens", type=int, default=6144)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--full-dist", action="store_true",
                         help="Use full vocabulary KL instead of top-K")

@@ -9,10 +9,6 @@ from data_modules.livecodebench.rollout import livecodebench_rollout
 from analysis.experiment_1_reward_on_regen import compute_reward
 
 
-def cosine_similarity(tensor1: torch.Tensor, tensor2: torch.Tensor) -> torch.Tensor:
-    return F.cosine_similarity(tensor1, tensor2, dim=-1)
-
-
 def compute_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -30,18 +26,14 @@ def compute_loss(
     return (s_probs * (s_log_probs - t_log_probs)).sum(dim=-1) * mask
 
 
-def compute_gradient(
+def compute_gradient_norm(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     student_messages: List[Dict[str, str]],
     teacher_messages: List[Dict[str, str]],
     top_k: int = 20,
-    mode: str = "first_25",  # "first_25" or "last_25"
-) -> torch.Tensor:
-    original_state_dict = {
-        name: tensor.detach().clone()
-        for name, tensor in model.state_dict().items()
-    }
+    mode: str = "first_25",
+) -> float:
     model.train()
 
     student_prompt_lengths = len(tokenizer.apply_chat_template(
@@ -59,8 +51,6 @@ def compute_gradient(
         teacher_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
     completion_lengths = student_full["attention_mask"].sum(
         dim=-1) - torch.tensor(student_prompt_lengths)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     student_full = {k: v.to(model.device) for k, v in student_full.items()}
     outputs = model(**student_full)
@@ -90,27 +80,25 @@ def compute_gradient(
     else:
         raise ValueError(f"Invalid mode: {mode}")
 
-    optimizer.zero_grad()
+    model.zero_grad(set_to_none=True)
     token_losses = compute_loss(
         student_logits, teacher_logits, mask, top_k)
     loss = token_losses.sum() / mask.sum().clamp(min=1.0)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
 
-    grads = []
-    for name, param in model.named_parameters():
+    grad_norm_sq = torch.zeros((), device=model.device, dtype=torch.float32)
+    for _, param in model.named_parameters():
         if param.grad is not None:
-            grads.append(param.grad.detach().clone().flatten())
-    flat_grads = torch.cat(grads)
+            grad_norm_sq += param.grad.detach().float().pow(2).sum()
 
-    model.load_state_dict(original_state_dict)
+    grad_norm = torch.sqrt(grad_norm_sq).item()
+    model.zero_grad(set_to_none=True)
     model.eval()
 
-    return flat_grads.cpu()
+    return grad_norm
 
 
-def run_experiment_3(
+def run_experiment_3_5(
     model_name: str = "Qwen/Qwen3-1.7B",
     num_problems: int = 15,
     num_rollouts: int = 4,
@@ -123,14 +111,6 @@ def run_experiment_3(
         if not values:
             return float("nan")
         return sum(values) / len(values)
-
-    def pairwise_cosine_similarities(grads: List[torch.Tensor]) -> List[float]:
-        similarities: List[float] = []
-        for i in range(len(grads)):
-            for j in range(i + 1, len(grads)):
-                similarities.append(cosine_similarity(
-                    grads[i], grads[j]).item())
-        return similarities
 
     print("Loading model and tokenizer...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -184,63 +164,51 @@ def run_experiment_3(
                 {"role": "assistant", "content": rollout.completion},
             ]
 
-            first_25_grads = compute_gradient(
-                model, tokenizer, student_messages, teacher_messages, mode="first_25")
-            last_25_grads = compute_gradient(
-                model, tokenizer, student_messages, teacher_messages, mode="last_25")
+            first_25_grad_norm = compute_gradient_norm(
+                model, tokenizer, student_messages, teacher_messages, top_k=top_k, mode="first_25")
+            last_25_grad_norm = compute_gradient_norm(
+                model, tokenizer, student_messages, teacher_messages, top_k=top_k, mode="last_25")
 
             rollout_records.append({
                 "rollout_idx": r_idx,
                 "correct": reward == 1.0,
-                "first_25_grads": first_25_grads,
-                "last_25_grads": last_25_grads,
+                "first_25_grad_norm": first_25_grad_norm,
+                "last_25_grad_norm": last_25_grad_norm,
             })
 
         correct_records = [r for r in rollout_records if r["correct"]]
         incorrect_records = [r for r in rollout_records if not r["correct"]]
 
-        all_similarities = {
-            "first_25": pairwise_cosine_similarities(
-                [r["first_25_grads"] for r in rollout_records]
-            ),
-            "last_25": pairwise_cosine_similarities(
-                [r["last_25_grads"] for r in rollout_records]
-            ),
+        all_grad_norms = {
+            "first_25": [r["first_25_grad_norm"] for r in rollout_records],
+            "last_25": [r["last_25_grad_norm"] for r in rollout_records],
         }
-        correct_similarities = {
-            "first_25": pairwise_cosine_similarities(
-                [r["first_25_grads"] for r in correct_records]
-            ),
-            "last_25": pairwise_cosine_similarities(
-                [r["last_25_grads"] for r in correct_records]
-            ),
+        correct_grad_norms = {
+            "first_25": [r["first_25_grad_norm"] for r in correct_records],
+            "last_25": [r["last_25_grad_norm"] for r in correct_records],
         }
-        incorrect_similarities = {
-            "first_25": pairwise_cosine_similarities(
-                [r["first_25_grads"] for r in incorrect_records]
-            ),
-            "last_25": pairwise_cosine_similarities(
-                [r["last_25_grads"] for r in incorrect_records]
-            ),
+        incorrect_grad_norms = {
+            "first_25": [r["first_25_grad_norm"] for r in incorrect_records],
+            "last_25": [r["last_25_grad_norm"] for r in incorrect_records],
         }
 
         results.append({
             "problem_idx": prob_idx,
-            "all_similarities": all_similarities,
-            "correct_similarities": correct_similarities,
-            "incorrect_similarities": incorrect_similarities,
+            "all_grad_norms": all_grad_norms,
+            "correct_grad_norms": correct_grad_norms,
+            "incorrect_grad_norms": incorrect_grad_norms,
         })
 
         print(f"Problem {prob_idx} summary")
         print(f"  Num correct: {len(correct_records)}/{len(rollout_records)}")
-        print(f"  all_similarities: {all_similarities}")
-        print(f"  correct_similarities: {correct_similarities}")
-        print(f"  incorrect_similarities: {incorrect_similarities}")
+        print(f"  all_grad_norms: {all_grad_norms}")
+        print(f"  correct_grad_norms: {correct_grad_norms}")
+        print(f"  incorrect_grad_norms: {incorrect_grad_norms}")
         print()
 
     summary: Dict[str, Any] = {}
     print("=" * 70)
-    for stratum_name in ["all_similarities", "correct_similarities", "incorrect_similarities"]:
+    for stratum_name in ["all_grad_norms", "correct_grad_norms", "incorrect_grad_norms"]:
         first_25_problem_means = [
             mean_or_nan(r[stratum_name]["first_25"])
             for r in results
@@ -256,17 +224,17 @@ def run_experiment_3(
         mean_last_25_across_problems = mean_or_nan(last_25_problem_means)
 
         summary[stratum_name] = {
-            "num_problems_with_pairs_first_25": len(first_25_problem_means),
-            "num_problems_with_pairs_last_25": len(last_25_problem_means),
+            "num_problems_with_first_25": len(first_25_problem_means),
+            "num_problems_with_last_25": len(last_25_problem_means),
             "mean_first_25_across_problems": mean_first_25_across_problems,
             "mean_last_25_across_problems": mean_last_25_across_problems,
         }
 
         print(f"SUMMARY — {stratum_name} (across problems)")
         print(
-            f"  Mean first 25 cosine similarity: {mean_first_25_across_problems:.4f}")
+            f"  Mean first 25 gradient norm: {mean_first_25_across_problems:.4f}")
         print(
-            f"  Mean last 25 cosine similarity: {mean_last_25_across_problems:.4f}")
+            f"  Mean last 25 gradient norm: {mean_last_25_across_problems:.4f}")
         print()
         print("=" * 70)
 
@@ -275,7 +243,7 @@ def run_experiment_3(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Experiment 3: Cosine similarity of gradients"
+        description="Experiment 3.5: Gradient norms"
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--num-problems", type=int, default=15)
@@ -286,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="analysis/results")
     args = parser.parse_args()
 
-    run_experiment_3(
+    run_experiment_3_5(
         model_name=args.model_name,
         num_problems=args.num_problems,
         num_rollouts=args.num_rollouts,
