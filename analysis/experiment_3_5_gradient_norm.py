@@ -80,7 +80,6 @@ def compute_gradient_norm(
     else:
         raise ValueError(f"Invalid mode: {mode}")
 
-    model.zero_grad(set_to_none=True)
     token_losses = compute_loss(
         student_logits, teacher_logits, mask, top_k)
     loss = token_losses.sum() / mask.sum().clamp(min=1.0)
@@ -92,6 +91,7 @@ def compute_gradient_norm(
             grad_norm_sq += param.grad.detach().float().pow(2).sum()
 
     grad_norm = torch.sqrt(grad_norm_sq).item()
+    
     model.zero_grad(set_to_none=True)
     model.eval()
 

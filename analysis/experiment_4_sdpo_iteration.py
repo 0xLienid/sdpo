@@ -13,6 +13,20 @@ from analysis.experiment_1_reward_on_regen import compute_reward
 from analysis.experiment_2_5_teacher_prompt_ablation import get_metrics
 
 
+def to_jsonable(value: Any) -> Any:
+    """Recursively convert tensors/containers to JSON-serializable values."""
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        return value.item() if value.ndim == 0 else value.tolist()
+    if isinstance(value, dict):
+        return {k: to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_jsonable(v) for v in value]
+    if isinstance(value, tuple):
+        return [to_jsonable(v) for v in value]
+    return value
+
+
 def compute_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -63,101 +77,101 @@ def run_training_loop(
         name: tensor.detach().clone().cpu()
         for name, tensor in model.state_dict().items()
     }
+    results = []
+
     model.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    for rollout_idx in range(num_rollouts):
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-    results = []
-    for iteration in range(num_iterations):
-        print(f"Running iteration {iteration + 1} of {num_iterations}")
+        for iteration in range(num_iterations):
+            print(f"Running iteration {iteration + 1} of {num_iterations}")
 
-        rollout_records = []
+            rollout_records = []
 
-        rollout = livecodebench_rollout(
-            model, tokenizer, example,
-            num_rollouts=1,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-        )[0]
+            rollout = livecodebench_rollout(
+                model, tokenizer, example,
+                num_rollouts=1,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+            )[0]
 
-        feedback = get_environment_feedback(
-            prompt=rollout.prompt, completion=rollout.completion,
-            example=example,
-        )
-        reward = compute_reward(feedback)
+            feedback = get_environment_feedback(
+                prompt=rollout.prompt, completion=rollout.completion,
+                example=example,
+            )
+            reward = compute_reward(feedback)
 
-        student_messages = [
-            {"role": "user",
-                "content": f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{example['question_content']}"},
-            {"role": "assistant", "content": rollout.completion}
-        ]
-        teacher_messages = [
-            {"role": "user",
-                "content": f"## Question\n{example['question_content']}\n\n## Previous Attempt\n{rollout.completion}\n\n## Feedback (from environment) for the previous attempt\n{feedback.feedback_text}\nCorrectly solve the original question."},
-            {"role": "assistant", "content": rollout.completion}
-        ]
+            student_messages = [
+                {"role": "user",
+                    "content": f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{example['question_content']}"},
+                {"role": "assistant", "content": rollout.completion}
+            ]
+            teacher_messages = [
+                {"role": "user",
+                    "content": f"## Question\n{example['question_content']}\n\n## Previous Attempt\n{rollout.completion}\n\n## Feedback (from environment) for the previous attempt\n{feedback.feedback_text}\nCorrectly solve the original question."},
+                {"role": "assistant", "content": rollout.completion}
+            ]
 
-        student_prompt_lengths = len(tokenizer.apply_chat_template(
-            [student_messages[0]], tokenize=True, add_generation_prompt=True,
-        )["input_ids"])
-        teacher_prompt_lengths = len(tokenizer.apply_chat_template(
-            [teacher_messages[0]], tokenize=True, add_generation_prompt=True,
-        )["input_ids"])
+            student_prompt_lengths = len(tokenizer.apply_chat_template(
+                [student_messages[0]], tokenize=True, add_generation_prompt=True,
+            )["input_ids"])
+            teacher_prompt_lengths = len(tokenizer.apply_chat_template(
+                [teacher_messages[0]], tokenize=True, add_generation_prompt=True,
+            )["input_ids"])
 
-        student_full = tokenizer.apply_chat_template(
-            student_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
-        teacher_full = tokenizer.apply_chat_template(
-            teacher_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
-        completion_length = student_full["input_ids"].shape[1] - student_prompt_lengths
-        print(student_full["input_ids"].shape)
-        print(teacher_full["input_ids"].shape)
-        print(student_prompt_lengths, teacher_prompt_lengths, completion_length)
+            student_full = tokenizer.apply_chat_template(
+                student_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
+            teacher_full = tokenizer.apply_chat_template(
+                teacher_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
+            completion_length = student_full["input_ids"].shape[1] - student_prompt_lengths
 
-        student_full = {k: v.to(model.device) for k, v in student_full.items()}
-        outputs = model(**student_full)
+            student_full = {k: v.to(model.device) for k, v in student_full.items()}
+            outputs = model(**student_full)
 
-        teacher_full = {k: v.to(model.device) for k, v in teacher_full.items()}
-        with torch.no_grad():
-            teacher_outputs = model(**teacher_full)
-        del teacher_full
+            teacher_full = {k: v.to(model.device) for k, v in teacher_full.items()}
+            with torch.no_grad():
+                teacher_outputs = model(**teacher_full)
+            del teacher_full
 
-        student_logits = outputs.logits[:, student_prompt_lengths -
-                                        1:student_prompt_lengths + completion_length - 1, :]
-        teacher_logits = teacher_outputs.logits[:, teacher_prompt_lengths -
-                                                1:teacher_prompt_lengths + completion_length - 1, :]
-        completion_ids = student_full["input_ids"][:, student_prompt_lengths:student_prompt_lengths + completion_length]
-        mask = torch.ones(1, completion_length, device=model.device)
+            student_logits = outputs.logits[:, student_prompt_lengths -
+                                            1:student_prompt_lengths + completion_length - 1, :]
+            teacher_logits = teacher_outputs.logits[:, teacher_prompt_lengths -
+                                                    1:teacher_prompt_lengths + completion_length - 1, :]
+            completion_ids = student_full["input_ids"][:, student_prompt_lengths:student_prompt_lengths + completion_length]
+            mask = torch.ones(1, completion_length, device=model.device)
 
-        optimizer.zero_grad()
-        token_losses = compute_loss(
-            student_logits, teacher_logits, mask, top_k)
-        loss = token_losses.sum() / mask.sum().clamp(min=1.0)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            optimizer.zero_grad()
+            token_losses = compute_loss(
+                student_logits, teacher_logits, mask, top_k)
+            loss = token_losses.sum() / mask.sum().clamp(min=1.0)
+            loss.backward()
+            optimizer.step()
 
-        metrics = get_metrics(
-            student_logits, teacher_logits, completion_ids, mask, top_k)
-        results.append({
-            "iteration": iteration,
-            "correct": reward == 1.0,
-            "metrics": metrics,
-        })
+            metrics = get_metrics(
+                student_logits, teacher_logits, completion_ids, mask, top_k)
+            results.append({
+                "rollout_idx": rollout_idx,
+                "iteration": iteration,
+                "correct": reward == 1.0,
+                "metrics": metrics,
+            })
 
-    model.load_state_dict(original_state_dict)
+        model.load_state_dict(original_state_dict)
+        
     model.eval()
     return results
 
 
 def run_experiment_4(
     model_name: str = "Qwen/Qwen3-1.7B",
-    num_problems: int = 10,
+    num_problems: int = 4,
     num_rollouts: int = 4,
     temperature: float = 1.0,
     max_new_tokens: int = 8192,
     top_k: int = 20,
     num_iterations: int = 5,
-    output_dir: str = "analysis/results",
+    output_dir: str = "analysis/results/test",
 ) -> Dict[str, Any]:
     """Run Experiment 4: SDPO Iteration."""
     print("Running Experiment 4: SDPO Iteration")
@@ -223,7 +237,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--num_iterations", type=int, default=5)
-    parser.add_argument("--output_dir", type=str, default="analysis/results")
+    parser.add_argument("--output_dir", type=str, default="analysis/results/test")
     args = parser.parse_args()
 
     results = run_experiment_4(
@@ -239,5 +253,5 @@ if __name__ == "__main__":
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "experiment_4.json"), "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(to_jsonable(results), f, indent=2)
     print(f"Results saved to: {args.output_dir}")

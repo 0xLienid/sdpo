@@ -38,10 +38,6 @@ def compute_gradient(
     top_k: int = 20,
     mode: str = "first_25",  # "first_25" or "last_25"
 ) -> torch.Tensor:
-    original_state_dict = {
-        name: tensor.detach().clone()
-        for name, tensor in model.state_dict().items()
-    }
     model.train()
 
     student_prompt_lengths = len(tokenizer.apply_chat_template(
@@ -59,8 +55,6 @@ def compute_gradient(
         teacher_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
     completion_lengths = student_full["attention_mask"].sum(
         dim=-1) - torch.tensor(student_prompt_lengths)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     student_full = {k: v.to(model.device) for k, v in student_full.items()}
     outputs = model(**student_full)
@@ -90,13 +84,10 @@ def compute_gradient(
     else:
         raise ValueError(f"Invalid mode: {mode}")
 
-    optimizer.zero_grad()
     token_losses = compute_loss(
         student_logits, teacher_logits, mask, top_k)
     loss = token_losses.sum() / mask.sum().clamp(min=1.0)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
 
     grads = []
     for name, param in model.named_parameters():
@@ -104,7 +95,7 @@ def compute_gradient(
             grads.append(param.grad.detach().clone().flatten())
     flat_grads = torch.cat(grads)
 
-    model.load_state_dict(original_state_dict)
+    model.zero_grad(set_to_none=True)
     model.eval()
 
     return flat_grads.cpu()

@@ -60,7 +60,7 @@ def livecodebench_rollout(
     prompt_len = inputs.input_ids.shape[1]
 
     # Generate multiple rollouts
-    do_sample = temperature > 0 and num_rollouts > 1
+    do_sample = temperature > 0 # and num_rollouts > 1
 
     with torch.no_grad():
         generation_kwargs = {
