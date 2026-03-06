@@ -52,33 +52,22 @@ def aggregate(path: str) -> Dict[str, Any]:
     filtered = []
     for problem in problems:
         metrics = problem.get("metrics", [])
-        iter0s = [m for m in metrics if m.get("iteration") == 0]
-        
-        skip = False
-        for iter0 in iter0s:
-            if iter0["correct"]:
-                skip = True
-                break
 
-        if skip:
-            continue
+        for step in metrics:
+            if step["iteration"] == 0 and step["correct"] == True:
+                continue
 
-        filtered.append(problem)
+            filtered.append(step)
 
     kl_by_iteration = defaultdict(list)
     disagreement_by_iteration = defaultdict(list)
-    step_count = 0
 
-    for problem in filtered:
-        for step in problem.get("metrics", []):
-            step_count += 1
-            iteration = step.get("iteration")
+    for step in filtered:
+        iteration = step["iteration"]
 
-            kl_ventiles = step["metrics"]["kl_ventiles"][0]
-            disagreement_ventiles = step["metrics"]["disagreement_ventiles"][0]
-
-            kl_by_iteration[iteration].append(kl_ventiles)
-            disagreement_by_iteration[iteration].append(disagreement_ventiles)
+        kl_by_iteration[iteration].append(step["metrics"]["kl_ventiles"][0])
+        disagreement_by_iteration[iteration].append(
+            step["metrics"]["disagreement_ventiles"][0])
 
     kl_average_by_iteration = defaultdict(list)
     disagreement_average_by_iteration = defaultdict(list)
@@ -102,9 +91,8 @@ def aggregate(path: str) -> Dict[str, Any]:
         disagreement_average_by_iteration[iteration] = average_disagreement
 
     return {
-        "total_steps": step_count,
+        "total_steps": len(filtered),
         "total_problems": len(problems),
-        "problems_after_filter": len(filtered),
         "iteration_average_kl_ventiles": kl_average_by_iteration,
         "iteration_average_disagreement_ventiles": disagreement_average_by_iteration
     }
@@ -128,7 +116,6 @@ def main() -> None:
 
     print(f"Total steps: {results['total_steps']}")
     print(f"Total problems: {results['total_problems']}")
-    print(f"Problems after filtering iteration 0 correct: {results['problems_after_filter']}\n")
 
     print("Average KL ventiles by iteration:")
     for iteration in sorted(results["iteration_average_kl_ventiles"].keys()):
@@ -138,7 +125,8 @@ def main() -> None:
     print("\nAverage disagreement ventiles by iteration:")
     for iteration in sorted(results["iteration_average_disagreement_ventiles"].keys()):
         values = results["iteration_average_disagreement_ventiles"][iteration]
-        print(f"iteration_{iteration}_average_disagreement_ventiles = {values}")
+        print(
+            f"iteration_{iteration}_average_disagreement_ventiles = {values}")
 
 
 if __name__ == "__main__":
