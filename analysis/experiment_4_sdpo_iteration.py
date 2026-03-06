@@ -174,7 +174,7 @@ def run_training_loop(
             teacher_full = {k: v.to(model.device)
                             for k, v in teacher_full.items()}
             with torch.no_grad():
-                teacher_outputs = model(**teacher_full)
+                teacher_outputs = teacher(**teacher_full)
             del teacher_full
 
             student_logits = outputs.logits[:, student_prompt_lengths -
