@@ -13,6 +13,45 @@ from analysis.experiment_1_reward_on_regen import compute_reward
 from analysis.experiment_2_5_teacher_prompt_ablation import get_metrics
 
 
+class EMATeacher:
+    def __init__(
+        self,
+        student_model: AutoModelForCausalLM,
+        decay: float = 0.99,
+        device: Optional[torch.device] = None,
+    ):
+        self.decay = decay
+        self.model = copy.deepcopy(student_model)
+
+        if device is not None:
+            self.model = self.model.to(device)
+
+        self.model.requires_grad_(False)
+        self.model.eval()
+
+        if hasattr(self.model, 'gradient_checkpointing_disable'):
+            self.model.gradient_checkpointing_disable()
+
+    def to(self, device: torch.device) -> "EMATeacher":
+        self.model = self.model.to(device)
+        return self
+
+    @torch.no_grad()
+    def update(self, student_model: AutoModelForCausalLM):
+        student_params = dict(student_model.named_parameters())
+        for name, teacher_param in self.model.named_parameters():
+            if name in student_params:
+                student_param = student_params[name]
+                teacher_param.mul_(self.decay).add_(
+                    student_param.data, alpha=1 - self.decay)
+
+    def __call__(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        return self.model.generate(*args, **kwargs)
+
+
 def to_jsonable(value: Any) -> Any:
     """Recursively convert tensors/containers to JSON-serializable values."""
     if isinstance(value, torch.Tensor):
@@ -77,11 +116,12 @@ def run_training_loop(
         name: tensor.detach().clone().cpu()
         for name, tensor in model.state_dict().items()
     }
-    results = []
-
     model.train()
 
+    results = []
+
     for rollout_idx in range(num_rollouts):
+        teacher = EMATeacher(model)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
         for iteration in range(num_iterations):
@@ -124,12 +164,15 @@ def run_training_loop(
                 student_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
             teacher_full = tokenizer.apply_chat_template(
                 teacher_messages, tokenize=True, add_generation_prompt=False, padding=True, return_tensors="pt", return_in_dict=True)
-            completion_length = student_full["input_ids"].shape[1] - student_prompt_lengths
+            completion_length = student_full["input_ids"].shape[1] - \
+                student_prompt_lengths
 
-            student_full = {k: v.to(model.device) for k, v in student_full.items()}
+            student_full = {k: v.to(model.device)
+                            for k, v in student_full.items()}
             outputs = model(**student_full)
 
-            teacher_full = {k: v.to(model.device) for k, v in teacher_full.items()}
+            teacher_full = {k: v.to(model.device)
+                            for k, v in teacher_full.items()}
             with torch.no_grad():
                 teacher_outputs = model(**teacher_full)
             del teacher_full
@@ -138,7 +181,8 @@ def run_training_loop(
                                             1:student_prompt_lengths + completion_length - 1, :]
             teacher_logits = teacher_outputs.logits[:, teacher_prompt_lengths -
                                                     1:teacher_prompt_lengths + completion_length - 1, :]
-            completion_ids = student_full["input_ids"][:, student_prompt_lengths:student_prompt_lengths + completion_length]
+            completion_ids = student_full["input_ids"][:,
+                                                       student_prompt_lengths:student_prompt_lengths + completion_length]
             mask = torch.ones(1, completion_length, device=model.device)
 
             optimizer.zero_grad()
@@ -147,6 +191,8 @@ def run_training_loop(
             loss = token_losses.sum() / mask.sum().clamp(min=1.0)
             loss.backward()
             optimizer.step()
+
+            teacher.update(model)
 
             metrics = get_metrics(
                 student_logits, teacher_logits, completion_ids, mask, top_k)
@@ -158,7 +204,7 @@ def run_training_loop(
             })
 
         model.load_state_dict(original_state_dict)
-        
+
     model.eval()
     return results
 
@@ -237,7 +283,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--num_iterations", type=int, default=5)
-    parser.add_argument("--output_dir", type=str, default="analysis/results/test")
+    parser.add_argument("--output_dir", type=str,
+                        default="analysis/results/test")
     args = parser.parse_args()
 
     results = run_experiment_4(
